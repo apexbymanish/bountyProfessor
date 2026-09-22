@@ -173,32 +173,43 @@ gets scored: they restrict *which institutions get queried*, not how many people
 ranked.
 
 Ranks are never hand-typed into this repository — they change every year and the major
-rankings disagree. There are exactly two sourced ways to build a tier:
+rankings disagree. There are exactly two sourced ways to build a tier, and each needs its own
+resolution step before `discover --tier` can use it, because each leaves OpenAlex ids unbound
+in a different way:
+
+**Korea top 20 (or any country) — live OpenAlex output, one command:**
 
 ```bash
-# Live OpenAlex research output — reproducible, current by construction, needs no file.
 gradpath institutions top --country KR --limit 20 --tier korea-20
-
-# A QS/THE/ARWU snapshot you supply and can cite. See data/rankings/README.md — snapshots
-# are never committed to this repo, and OpenAlex ids are resolved separately (below).
-gradpath institutions import --csv data/rankings/qs2026.csv --tier world-100 --top 100
 ```
 
-`institutions top` also *resolves*: a curated row already seeded from `data/institutions.yaml`
-(with its adapter) is matched by homepage domain and gets its OpenAlex id filled in, rather
-than being duplicated under a name-derived slug. Run it again for a CSV-imported tier's
-countries to resolve those rows the same way.
+`institutions top` seeds *and* resolves in the same step: a curated row already seeded from
+`data/institutions.yaml` (with its adapter) is matched by homepage domain and gets its
+OpenAlex id filled in, rather than being duplicated under a name-derived slug. No further step
+is needed before `discover --tier korea-20`.
 
-Once a tier has institutions with resolved OpenAlex ids, scope discovery to it:
+**World top 100 (or any QS/THE/ARWU snapshot) — three steps:**
 
 ```bash
-gradpath discover --field efficient-ml --tier korea-20
+# 1. Import a snapshot you supply and can cite (see data/rankings/README.md — snapshots
+#    are never committed to this repo). OpenAlex ids are left unresolved: a CSV row has no
+#    homepage, so institutions top's domain matching can never reach it.
+gradpath institutions import --csv data/rankings/qs2026.csv --tier world-100 --top 100
+
+# 2. Resolve those rows separately, by an exact normalised name match against OpenAlex
+#    (case/punctuation/diacritics/leading "The" folded away) -- never a fuzzy match, since a
+#    wrong bind would silently attach one institution's rank to a different one. A near-match
+#    or a tie is left unresolved and printed for you to check by hand.
+gradpath institutions resolve --tier world-100
+
+# 3. Now the tier has resolved OpenAlex ids and discover can use it.
+gradpath discover --field efficient-ml --tier world-100
 ```
 
 `--institution` accepts either a seeded slug (e.g. `kaist`, resolved via the `institutions`
 table) or a raw OpenAlex institution id, passed through unchanged. A slug with no resolved
-OpenAlex id yet fails with a message telling you to run `gradpath institutions top` first,
-rather than silently discovering nothing for it.
+OpenAlex id yet fails with a message telling you to run `institutions top` or
+`institutions resolve` first, rather than silently discovering nothing for it.
 
 ## License
 

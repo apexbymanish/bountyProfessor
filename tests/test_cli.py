@@ -606,3 +606,62 @@ def test_institutions_import_cli_seeds_a_csv_snapshot(tmp_path):
     ).fetchone()
     assert row["tier"] == "world-100"
     assert row["openalex_id"] is None
+
+
+@respx.mock
+def test_institutions_resolve_cli_binds_an_exact_match_and_reports_unresolved(tmp_path):
+    workspace = _workspace(tmp_path)
+    runner.invoke(app, ["--root", str(workspace), "init"])
+    csv_path = workspace / "snapshot.csv"
+    csv_path.write_text(
+        "rank,name,country\n"
+        "1,Massachusetts Institute of Technology,US\n"
+        "2,Some Ambiguous University,US\n"
+    )
+    runner.invoke(
+        app,
+        ["--root", str(workspace), "institutions", "import",
+         "--csv", str(csv_path), "--tier", "world-100", "--top", "100"],
+    )
+
+    def _openalex_search(request):
+        query = request.url.params.get("search", "")
+        if "Massachusetts" in query:
+            results = [{
+                "id": "https://openalex.org/I100", "ror": "https://ror.org/042nb2s44",
+                "display_name": "Massachusetts Institute of Technology",
+                "country_code": "US", "homepage_url": "https://web.mit.edu",
+                "works_count": 1, "cited_by_count": 1,
+            }]
+        else:
+            # Two tying candidates -- must be left unresolved, never guessed.
+            results = [
+                {"id": "https://openalex.org/I1", "display_name": "Some Ambiguous University",
+                 "country_code": "US", "homepage_url": None, "ror": None,
+                 "works_count": 1, "cited_by_count": 1},
+                {"id": "https://openalex.org/I2", "display_name": "Some Ambiguous University",
+                 "country_code": "US", "homepage_url": None, "ror": None,
+                 "works_count": 1, "cited_by_count": 1},
+            ]
+        return httpx.Response(200, json={"results": results})
+
+    respx.get("https://api.openalex.org/institutions").mock(side_effect=_openalex_search)
+    result = runner.invoke(
+        app, ["--root", str(workspace), "institutions", "resolve", "--tier", "world-100"]
+    )
+    assert result.exit_code == 0
+    assert "resolved 1" in result.output
+    assert "Some Ambiguous University" in result.output  # named as needing manual attention
+
+    from gradpath.db import connect
+
+    conn = connect(workspace / "gradpath.db")
+    resolved = conn.execute(
+        "SELECT openalex_id FROM institutions WHERE name = 'Massachusetts Institute of "
+        "Technology'"
+    ).fetchone()
+    unresolved = conn.execute(
+        "SELECT openalex_id FROM institutions WHERE name = 'Some Ambiguous University'"
+    ).fetchone()
+    assert resolved["openalex_id"] == "I100"
+    assert unresolved["openalex_id"] is None

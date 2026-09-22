@@ -8,6 +8,7 @@ from gradpath.net.http import PoliteClient
 from gradpath.sources.institutions import (
     InstitutionHit,
     import_ranking_csv,
+    resolve_institutions,
     top_institutions,
     upsert_institutions,
 )
@@ -169,3 +170,132 @@ def test_import_ranking_csv_rejects_a_file_missing_required_columns(db, tmp_path
     path.write_text("position,institution\n1,MIT\n")
     with pytest.raises(ValueError, match="rank.*name"):
         import_ranking_csv(db, path, "world-100", top=10)
+
+
+# --- R37b: `institutions resolve` binds OpenAlex ids onto CSV-imported rows
+# that `import_ranking_csv` deliberately left NULL (they have no `site` to
+# domain-match against, so `institutions top`'s resolution path can never
+# reach them). Matching is exact-normalised-name-or-nothing -- never
+# fuzzy -- because a wrong bind would silently attach one university's rank
+# and tier to a different institution, with every later display showing the
+# *stored* name and giving no visible sign anything went wrong.
+
+
+def _institutions_search_payload(hits: list[dict]) -> dict:
+    return {"results": hits}
+
+
+def _hit(name: str, openalex_id: str = "I1") -> dict:
+    return {
+        "id": f"https://openalex.org/{openalex_id}",
+        "ror": "https://ror.org/01abcde",
+        "display_name": name,
+        "country_code": "US",
+        "homepage_url": "https://example.edu",
+        "works_count": 1,
+        "cited_by_count": 1,
+    }
+
+
+@respx.mock
+def test_resolve_institutions_binds_an_exact_normalised_match(db, client):
+    db.execute(
+        "INSERT INTO institutions (id, name, tier, rank, added_at) "
+        "VALUES ('mit', 'The Massachusetts Institute of Technology', 'world-100', 1, "
+        "'2026-01-01')"
+    )
+    db.commit()
+    respx.get("https://api.openalex.org/institutions").mock(
+        return_value=httpx.Response(
+            200, json=_institutions_search_payload(
+                [_hit("Massachusetts Institute of Technology", "I100")]
+            )
+        )
+    )
+    report = resolve_institutions(db, client)
+    assert report.resolved == ["The Massachusetts Institute of Technology"]
+    assert report.unresolved == []
+    row = db.execute("SELECT openalex_id FROM institutions WHERE id = 'mit'").fetchone()
+    assert row["openalex_id"] == "I100"
+
+
+@respx.mock
+def test_resolve_institutions_leaves_a_near_match_unresolved_and_reports_it(db, client):
+    db.execute(
+        "INSERT INTO institutions (id, name, tier, rank, added_at) "
+        "VALUES ('icl', 'Imperial College London', 'world-100', 1, '2026-01-01')"
+    )
+    db.commit()
+    respx.get("https://api.openalex.org/institutions").mock(
+        return_value=httpx.Response(
+            200, json=_institutions_search_payload(
+                [_hit("Imperial College London Business School", "I200")]
+            )
+        )
+    )
+    report = resolve_institutions(db, client)
+    assert report.resolved == []
+    assert report.unresolved == ["Imperial College London"]
+    row = db.execute("SELECT openalex_id FROM institutions WHERE id = 'icl'").fetchone()
+    assert row["openalex_id"] is None
+
+
+@respx.mock
+def test_resolve_institutions_leaves_a_tie_unresolved(db, client):
+    db.execute(
+        "INSERT INTO institutions (id, name, tier, rank, added_at) "
+        "VALUES ('stanford', 'Stanford University', 'world-100', 1, '2026-01-01')"
+    )
+    db.commit()
+    respx.get("https://api.openalex.org/institutions").mock(
+        return_value=httpx.Response(
+            200, json=_institutions_search_payload([
+                _hit("Stanford University", "I300"),
+                _hit("Stanford University", "I301"),
+            ])
+        )
+    )
+    report = resolve_institutions(db, client)
+    assert report.resolved == []
+    assert report.unresolved == ["Stanford University"]
+    row = db.execute("SELECT openalex_id FROM institutions WHERE id = 'stanford'").fetchone()
+    assert row["openalex_id"] is None
+
+
+@respx.mock
+def test_resolve_institutions_does_not_requery_an_already_resolved_row(db, client):
+    db.execute(
+        "INSERT INTO institutions (id, name, openalex_id, tier, rank, added_at) "
+        "VALUES ('kaist', 'KAIST', 'I1', 'korea-20', 1, '2026-01-01')"
+    )
+    db.commit()
+    route = respx.get("https://api.openalex.org/institutions").mock(
+        return_value=httpx.Response(200, json=_institutions_search_payload([]))
+    )
+    report = resolve_institutions(db, client)
+    assert report.resolved == []
+    assert report.unresolved == []
+    assert route.call_count == 0
+
+
+@respx.mock
+def test_resolve_institutions_filters_by_tier(db, client):
+    db.execute(
+        "INSERT INTO institutions (id, name, tier, rank, added_at) "
+        "VALUES ('mit', 'Massachusetts Institute of Technology', 'world-100', 1, '2026-01-01')"
+    )
+    db.execute(
+        "INSERT INTO institutions (id, name, tier, rank, added_at) "
+        "VALUES ('other', 'Other University', 'other-tier', 1, '2026-01-01')"
+    )
+    db.commit()
+    route = respx.get("https://api.openalex.org/institutions").mock(
+        return_value=httpx.Response(
+            200, json=_institutions_search_payload(
+                [_hit("Massachusetts Institute of Technology", "I100")]
+            )
+        )
+    )
+    report = resolve_institutions(db, client, tier="world-100")
+    assert report.resolved == ["Massachusetts Institute of Technology"]
+    assert route.call_count == 1  # only the world-100 row was searched

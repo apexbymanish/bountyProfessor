@@ -35,11 +35,27 @@ rank,name,country
 Only `rank` and `name` are required; extra columns are ignored.
 
 `import_ranking_csv` deliberately leaves `openalex_id` NULL on every
-imported row — an import never invents an identifier it cannot verify.
-Resolution happens separately: running `gradpath institutions top` for the
-matching country later binds OpenAlex ids onto these rows by matching
-homepage domain (see `gradpath/sources/institutions.py`), the same way it
-resolves institutions seeded from `data/institutions.yaml`.
+imported row — an import never invents an identifier it cannot verify. A
+CSV row also carries no homepage, so `gradpath institutions top`'s
+homepage-domain resolution (the path that resolves institutions seeded from
+`data/institutions.yaml`) can never reach these rows.
+
+Resolution for a CSV-imported tier is a separate step:
+
+```
+gradpath institutions import --csv qs2026.csv --tier world-100 --top 100
+gradpath institutions resolve --tier world-100
+gradpath discover --field efficient-ml --tier world-100
+```
+
+`institutions resolve` searches OpenAlex by name and binds an id **only**
+on an exact, normalised match (case/punctuation/diacritics/leading "The"
+folded away) — never a fuzzy or "closest" match, since a wrong bind would
+silently attach one institution's rank and tier to a different one, with
+no visible sign anything went wrong (every later display shows the stored
+name, not whatever it matched). A near-match or a tie between candidates is
+left unresolved and printed so it can be checked by hand; `discover --tier`
+then only ever sees rows that were actually resolved.
 
 ## Recording provenance
 

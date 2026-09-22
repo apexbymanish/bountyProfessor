@@ -17,11 +17,19 @@ adapter. `upsert_institutions` instead matches, in order: an exact
 openalex_id, then a homepage-domain match against a seeded row's `site`,
 and only then falls back to slugify(name) for a genuinely new row. An
 adapter bound by hand is never overwritten by any of these paths.
+
+A row imported from a ranking CSV (`import_ranking_csv`) has no `site` at
+all, so that domain-matching path can never reach it -- `resolve_institutions`
+is the separate step that binds an OpenAlex id onto those rows, by an exact
+normalised name match only. See its docstring for why fuzzy matching is
+refused outright.
 """
 from __future__ import annotations
 
 import csv
+import re
 import sqlite3
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
@@ -162,9 +170,11 @@ def import_ranking_csv(
 ) -> int:
     """Import a QS/THE/ARWU ranking snapshot. See data/rankings/README.md for sources.
 
-    OpenAlex ids are left NULL here; running `gradpath institutions top` (or
-    another resolution pass) over the matching country later binds them, so
-    an import never invents an identifier it cannot verify.
+    OpenAlex ids are left NULL here -- a CSV row carries no homepage for
+    `upsert_institutions`'s domain matching to use, so `resolve_institutions`
+    (via `gradpath institutions resolve`) is the separate step that binds
+    them, by an exact normalised name match. An import never invents an
+    identifier it cannot verify.
     """
     with Path(path).open() as handle:
         reader = csv.DictReader(handle)
@@ -187,3 +197,91 @@ def import_ranking_csv(
                  tier, int(row["rank"]), f"csv:{Path(path).name}", now_iso()),
             )
     return len(rows)
+
+
+@dataclass(frozen=True)
+class ResolutionReport:
+    resolved: list[str]
+    unresolved: list[str]
+
+
+def _normalize_name(name: str) -> str:
+    """Fold a name to a comparable form: diacritics, case, punctuation and a
+    leading "The" removed. This is the *only* thing `resolve_institutions`
+    is allowed to consider a match -- see its docstring for why."""
+    text = unicodedata.normalize("NFKD", name)
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    text = text.lower()
+    text = re.sub(r"^the\s+", "", text)
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return text.strip()
+
+
+def _search_institution(client: PoliteClient, name: str) -> InstitutionHit | None:
+    """Search OpenAlex for `name` and return a hit only on an unambiguous,
+    exact normalised match. Anything else -- zero candidates, a near-match,
+    or a tie between two -- returns None so the caller leaves the row NULL.
+    """
+    payload = client.get_json(
+        f"{OPENALEX_BASE}/institutions",
+        with_mailto(client, {"search": name, "per-page": 25}),
+    )
+    target = _normalize_name(name)
+    matches = [
+        item for item in payload.get("results", [])
+        if _normalize_name(item.get("display_name") or "") == target
+    ]
+    if len(matches) != 1:
+        return None
+    item = matches[0]
+    return InstitutionHit(
+        openalex_id=_short_id(item.get("id")) or "",
+        ror_id=_short_id(item.get("ror")),
+        name=item.get("display_name") or "",
+        country=item.get("country_code"),
+        site=item.get("homepage_url"),
+        works_count=item.get("works_count") or 0,
+        cited_by_count=item.get("cited_by_count") or 0,
+    )
+
+
+def resolve_institutions(
+    conn: sqlite3.Connection, client: PoliteClient, tier: str | None = None
+) -> ResolutionReport:
+    """Bind OpenAlex ids onto rows that don't have one yet -- most commonly
+    institutions imported from a ranking CSV, whose rows are deliberately
+    left with `openalex_id IS NULL` (see `import_ranking_csv`) and carry no
+    `site`, so `upsert_institutions`'s homepage-domain resolution can never
+    reach them.
+
+    Matching is exact-normalised-name-or-nothing (see `_normalize_name`),
+    never fuzzy. A near match would silently bind one institution's rank
+    and tier onto a different one -- and the user would never see the
+    mistake, because every later display shows the *stored* name, not
+    whatever OpenAlex matched. That is the same class of failure this
+    project already refuses for ROR ids and email addresses: on any
+    ambiguity, leave the row unresolved and report it for a human to check.
+    Only rows still missing an openalex_id are queried at all.
+    """
+    query = "SELECT id, name FROM institutions WHERE openalex_id IS NULL"
+    params: tuple[str, ...] = ()
+    if tier:
+        query += " AND tier = ?"
+        params = (tier,)
+    rows = conn.execute(query, params).fetchall()
+
+    resolved: list[str] = []
+    unresolved: list[str] = []
+    for row in rows:
+        hit = _search_institution(client, row["name"])
+        if hit is None:
+            unresolved.append(row["name"])
+            continue
+        with conn:
+            conn.execute(
+                "UPDATE institutions SET openalex_id = ?, ror_id = COALESCE(?, ror_id), "
+                "site = COALESCE(?, site) WHERE id = ?",
+                (hit.openalex_id, hit.ror_id, hit.site, row["id"]),
+            )
+        resolved.append(row["name"])
+    return ResolutionReport(resolved=resolved, unresolved=unresolved)

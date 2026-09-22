@@ -171,9 +171,10 @@ def _resolve_institution_ids(conn: sqlite3.Connection, raw: list[str]) -> list[s
     without the caller ever knowing KAIST's OpenAlex id. A slug that is
     known but not yet resolved fails loudly (ruling R35) rather than
     silently dropping that institution from the run -- run
-    `gradpath institutions top` (or another resolution pass) first. A value
-    that matches no seeded slug is assumed to already be a raw OpenAlex id
-    and is passed through unchanged.
+    `gradpath institutions top` (institutions with a homepage) or
+    `gradpath institutions resolve` (CSV-imported institutions) first. A
+    value that matches no seeded slug is assumed to already be a raw
+    OpenAlex id and is passed through unchanged.
     """
     resolved: list[str] = []
     for value in raw:
@@ -186,7 +187,8 @@ def _resolve_institution_ids(conn: sqlite3.Connection, raw: list[str]) -> list[s
         if not row["openalex_id"]:
             console.print(
                 f"[red]institution '{value}' has no resolved OpenAlex id yet — "
-                f"run `gradpath institutions top` first[/red]"
+                f"run `gradpath institutions top` or `gradpath institutions resolve` "
+                f"first[/red]"
             )
             raise typer.Exit(code=1)
         resolved.append(row["openalex_id"])
@@ -239,7 +241,8 @@ def discover(
         if not rows:
             console.print(
                 f"[red]tier '{tier}' has no institutions with a resolved OpenAlex id — "
-                f"run `gradpath institutions top` first[/red]"
+                f"run `gradpath institutions top` or `gradpath institutions resolve` "
+                f"first[/red]"
             )
             raise typer.Exit(code=1)
         institution_ids = [row["openalex_id"] for row in rows]
@@ -580,15 +583,49 @@ def institutions_import(
 ) -> None:
     """Import a QS/THE/ARWU ranking snapshot. See data/rankings/README.md.
 
-    OpenAlex ids are left unresolved here -- `gradpath institutions top` over
-    the matching country later binds them by homepage domain, once the
-    curated data has a site to match against.
+    OpenAlex ids are left unresolved here -- a CSV row carries no homepage,
+    so `gradpath institutions top`'s domain matching can never reach it. Run
+    `gradpath institutions resolve --tier <tier>` next to bind them.
     """
     from gradpath.sources.institutions import import_ranking_csv
 
     _, _, conn, _ = _context()
     count = import_ranking_csv(conn, csv_path, tier, top)
     console.print(f"[green]imported {count}[/green] institutions as tier '{tier}'")
+
+
+@institutions_app.command("resolve")
+def institutions_resolve(
+    tier: Annotated[
+        str | None, typer.Option("--tier", help="Only resolve institutions in this tier")
+    ] = None,
+) -> None:
+    """Bind OpenAlex ids onto institutions that don't have one yet.
+
+    This is what makes a CSV-imported tier (e.g. world-100) usable with
+    `discover --tier`: `institutions import` deliberately leaves openalex_id
+    NULL, and those rows carry no homepage for `institutions top`'s domain
+    matching to use.
+
+    Matching accepts only an exact, normalised name match against OpenAlex's
+    display_name (case, punctuation, diacritics and a leading "The" folded
+    away) -- never a "closest" or fuzzy match. A near-match or a tie between
+    two candidates is left unresolved and reported here for manual checking,
+    rather than silently binding one institution's rank and tier onto a
+    different one.
+    """
+    from gradpath.sources.institutions import resolve_institutions
+
+    _, _, conn, client = _context()
+    report = resolve_institutions(conn, client, tier)
+    console.print(f"[green]resolved {len(report.resolved)}[/green] institutions")
+    if report.unresolved:
+        console.print(
+            f"[yellow]{len(report.unresolved)} need manual attention[/yellow] "
+            f"(no unambiguous exact name match found):"
+        )
+        for name in report.unresolved:
+            console.print(f"  {name}")
 
 
 if __name__ == "__main__":
