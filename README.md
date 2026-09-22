@@ -11,9 +11,10 @@ publishing in that area from OpenAlex, scores each one against your interests, e
 actually faculty rather than a PhD student, resolves contact addresses from authoritative
 sources, and gives you a ranked shortlist with the evidence behind every row.
 
-> **Status: in progress.** The library is built and tested (130+ tests); the `gradpath` CLI is
-> the next task, so today this is driven as a Python package rather than a command. See
-> [Current state](#current-state).
+> **Status: in progress.** The library and the `gradpath` CLI are built and tested (150+
+> tests). The one thing not yet built is institution-tier seeding (scoping a run to, say,
+> Korea's top 20 or the world top 100) — until then, `discover` is field-and-country-first.
+> See [Current state](#current-state).
 
 ## What makes it different
 
@@ -62,11 +63,11 @@ professor look like a first-year student.
 Working and tested: the SQLite schema and migrations, config and profile loading, the polite
 HTTP layer, OpenAlex parsing and ingest (resumable, crash-safe), fit scoring, faculty-likelihood
 scoring, the persisted embedding cache and uncapped matching, Crossref/ORCID/career enrichment,
-the email resolution chain, three institution adapters, budget-gated LLM reranking, and
-reporting/export.
+the email resolution chain, three institution adapters, budget-gated LLM reranking,
+reporting/export, and the `gradpath` CLI that wires all of it into one command.
 
-Not yet built: the `gradpath` CLI that wires these together, and the institution-tier seeding
-that scopes a run to, say, Korea's top 20 or the world top 100.
+Not yet built: institution-tier seeding, which will let `discover` scope a run to a named
+tier (say, Korea's top 20 or the world top 100) instead of just a field and a country list.
 
 Verified against live OpenAlex: a one-page discovery run returned 200 works, 1,039 researchers
 across 299 institutions, embedded and scored end to end in under two seconds.
@@ -96,6 +97,64 @@ Optional, for the LLM rerank step only:
 ```bash
 pip install -e ".[rerank]"
 export ANTHROPIC_API_KEY=...
+```
+
+## Usage
+
+`gradpath` needs a workspace: a `settings.yaml`, a `profile.yaml` (gitignored — it's yours),
+and `data/fields.yaml`/`data/institutions.yaml`. `--root` points every command at that
+workspace; omit it to use the current directory. You can also run it as `./gradpath.sh ...`
+from a checkout without installing.
+
+**No command below except the last one needs `ANTHROPIC_API_KEY`.** Everything up through
+`export` — discovery, fit scoring, faculty-likelihood scoring, email resolution, the ranked
+table and CSV/Markdown export — runs with zero API keys. Only `match --rerank` (the optional
+second-pass LLM scoring) requires a key, and it refuses cleanly and tells you so if one isn't
+set; your stage 1 results are unaffected either way.
+
+```bash
+# 1. Create the database, scaffold profile.yaml, and seed known institutions
+#    (with their adapters) from data/institutions.yaml. Fill in profile.yaml's
+#    contact_email and interests before continuing.
+gradpath init
+
+# 2. Not sure what OpenAlex calls your field? Search for its topic ids.
+gradpath fields search "efficient machine learning"
+
+# 3. Discover researchers publishing in a field, in the countries you care about.
+gradpath discover --field efficient-ml --country KR --since 2018
+
+# 4. Score everyone against your interests (fit). No top-N — everyone found is scored.
+gradpath match
+
+# 5. Fetch whole-career OpenAlex data for the top-ranked slice, so faculty
+#    scoring sees a person's real career span rather than just this query's
+#    window (see "How the scoring works" below). Runs one call per person,
+#    so it's bounded by --min-score/--faculty-only, same as emails resolve.
+gradpath faculty enrich-career --min-score 0.6
+
+# 6. Estimate who is faculty vs. a student/postdoc. Nobody is removed —
+#    this only fills a sortable column, and reports how many people were
+#    scored on real career data vs. the discovered slice.
+gradpath faculty score
+
+# 7. Resolve contact addresses for people who rank, so crawling effort
+#    follows the ranking (Crossref -> ORCID -> institution adapter -> crawler).
+gradpath emails resolve --min-score 0.7
+
+# 8. Look at the ranked shortlist.
+gradpath show --min-score 0.7 --faculty-only
+
+# 9. Export it.
+gradpath export --csv targets.csv
+
+# 10. Optional: ask Claude to re-score and explain the fit for the people
+#     already at or above --min-score. Needs ANTHROPIC_API_KEY. --budget is
+#     an approximate ceiling, not a hard cap — a call's real cost is only
+#     known after making it, so a run can finish up to one call's cost above
+#     the figure you pass; the actual measured spend is printed at the end.
+export ANTHROPIC_API_KEY=...
+gradpath match --rerank --min-score 0.7 --budget 2.00
 ```
 
 ## License
