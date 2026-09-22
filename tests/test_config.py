@@ -1,7 +1,10 @@
+from urllib.parse import urlparse
+
 import pytest
 
 from gradpath.config import (
-    load_fields, load_profile, load_settings, resolve_field, scaffold_profile,
+    load_fields, load_institutions, load_profile, load_settings, resolve_field,
+    scaffold_profile,
 )
 
 SETTINGS = """
@@ -70,7 +73,22 @@ def test_scaffold_then_load_roundtrips(tmp_path):
     p = tmp_path / "profile.yaml"
     scaffold_profile(p)
     assert p.exists()
-    assert "contact_email" in p.read_text()
+
+    # Fill in required fields and load it
+    profile_content = """name: default
+contact_email: test@example.com
+fields: []
+countries: []
+interests: test research area
+keywords: []
+seed_papers: []
+my_papers: []
+"""
+    p.write_text(profile_content)
+
+    profile = load_profile(p)
+    assert profile.contact_email == "test@example.com"
+    assert profile.interests == "test research area"
 
 
 def test_resolve_field_by_alias(tmp_path):
@@ -86,3 +104,69 @@ def test_resolve_unknown_field_raises(tmp_path):
     p.write_text(FIELDS)
     with pytest.raises(KeyError, match="nonsense"):
         resolve_field("nonsense", load_fields(p))
+
+
+def test_resolve_field_with_mixed_case_slug(tmp_path):
+    mixed_case_fields = """
+Efficient-ML:
+  label: Efficient machine learning
+  topics: [T10028, T11689]
+  aliases: [edge-ml, on-device-ml]
+"""
+    p = tmp_path / "fields.yaml"
+    p.write_text(mixed_case_fields)
+    fields = load_fields(p)
+    # The mixed-case key is normalized to lowercase
+    assert resolve_field("Efficient-ML", fields).label == "Efficient machine learning"
+    assert resolve_field("efficient-ml", fields).label == "Efficient machine learning"
+
+
+def test_load_institutions_with_adapters(tmp_path):
+    p = tmp_path / "institutions.yaml"
+    p.write_text("""
+kaist:
+  name: Korea Advanced Institute of Science and Technology
+  country: KR
+  site: https://www.kaist.ac.kr
+  adapter: kaist
+
+gist:
+  name: Gwangju Institute of Science and Technology
+  country: KR
+  site: https://www.gist.ac.kr
+  adapter: gist
+""")
+    institutions = load_institutions(p)
+    assert "kaist" in institutions
+    assert institutions["kaist"].adapter == "kaist"
+    assert institutions["gist"].adapter == "gist"
+
+
+def test_load_institutions_sites_are_absolute_urls(tmp_path):
+    p = tmp_path / "institutions.yaml"
+    p.write_text("""
+kaist:
+  name: Korea Advanced Institute of Science and Technology
+  country: KR
+  site: https://www.kaist.ac.kr
+  adapter: kaist
+""")
+    institutions = load_institutions(p)
+    site = institutions["kaist"].site
+    parsed = urlparse(site)
+    assert parsed.scheme != ""
+    assert parsed.netloc != ""
+    assert site.startswith("https://")
+
+
+def test_load_institutions_optional_fields_become_none(tmp_path):
+    p = tmp_path / "institutions.yaml"
+    p.write_text("""
+minimal:
+  name: Minimal Institution
+""")
+    institutions = load_institutions(p)
+    assert "minimal" in institutions
+    assert institutions["minimal"].country is None
+    assert institutions["minimal"].site is None
+    assert institutions["minimal"].adapter is None

@@ -43,3 +43,12 @@ class FacultyRecord:
     title: str | None
     homepage: str | None
     dept: str | None
+
+
+@dataclass(frozen=True)
+class InstitutionSeed:
+    slug: str
+    name: str
+    country: str | None
+    site: str | None
+    adapter: str | None

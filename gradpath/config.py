@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from pathlib import Path
+from urllib.parse import urlparse
 
 import yaml
 
-from gradpath.models import FieldDef, Profile, Settings
+from gradpath.models import FieldDef, InstitutionSeed, Profile, Settings
+from gradpath.util import slugify
 
 MAX_RATE_LIMIT = 1.0
 
@@ -78,6 +80,7 @@ def load_profile(path: Path) -> Profile:
 
 
 def scaffold_profile(path: Path) -> None:
+    """Generate a profile template, raising FileExistsError if the file already exists."""
     if path.exists():
         raise FileExistsError(f"{path} already exists; refusing to overwrite")
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -87,8 +90,8 @@ def scaffold_profile(path: Path) -> None:
 def load_fields(path: Path) -> dict[str, FieldDef]:
     raw = _read_yaml(path)
     return {
-        slug: FieldDef(
-            slug=slug,
+        slugify(slug): FieldDef(
+            slug=slugify(slug),
             label=body["label"],
             topics=list(body["topics"]),
             aliases=list(body.get("aliases") or []),
@@ -107,3 +110,17 @@ def resolve_field(name: str, fields: dict[str, FieldDef]) -> FieldDef:
     raise KeyError(
         f"unknown field {name!r} — run `gradpath fields search` to find its OpenAlex topics"
     )
+
+
+def load_institutions(path: Path) -> dict[str, InstitutionSeed]:
+    raw = _read_yaml(path)
+    return {
+        slugify(slug): InstitutionSeed(
+            slug=slugify(slug),
+            name=body["name"],
+            country=body.get("country"),
+            site=body.get("site"),
+            adapter=body.get("adapter"),
+        )
+        for slug, body in raw.items()
+    }
