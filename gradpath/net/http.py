@@ -66,6 +66,7 @@ class PoliteClient:
         origin = f"{parsed.scheme}://{parsed.netloc}"
         if origin not in self._robots:
             parser = urllib.robotparser.RobotFileParser()
+            self._limiter.wait(parsed.netloc)
             try:
                 response = self._client.get(f"{origin}/robots.txt")
                 if response.status_code == 200:
@@ -73,6 +74,10 @@ class PoliteClient:
                 else:
                     parser = None  # absent robots.txt means unrestricted
             except httpx.HTTPError:
+                # A single attempt only: an unreachable robots.txt already
+                # has a defined meaning (unrestricted), and this must never
+                # retry or count against the host's circuit-breaker budget,
+                # or a down robots endpoint would disable content fetching.
                 parser = None
             self._robots[origin] = parser
         parser = self._robots[origin]
