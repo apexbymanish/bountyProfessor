@@ -1,0 +1,18 @@
+# personal data — never commit
+profile.yaml
+*.db
+*.sqlite3
+.cache/
+out/
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# os
+.DS_Store
