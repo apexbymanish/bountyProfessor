@@ -74,11 +74,12 @@ def _upsert_institution(conn: sqlite3.Connection, a: ParsedAuthorship) -> tuple[
     ).fetchone()
     if row:
         return row["id"], False
-    slug = slugify(a.institution_name or a.institution_openalex_id)
+    name = a.institution_name or a.institution_openalex_id
+    slug = slugify(name)
     conn.execute(
         "INSERT OR IGNORE INTO institutions "
         "(id, name, openalex_id, country, discovered, added_at) VALUES (?, ?, ?, ?, 1, ?)",
-        (slug, a.institution_name, a.institution_openalex_id, a.institution_country, now_iso()),
+        (slug, name, a.institution_openalex_id, a.institution_country, now_iso()),
     )
     return slug, True
 

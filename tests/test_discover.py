@@ -126,3 +126,32 @@ def test_discover_skips_work_with_missing_openalex_id(tmp_path):
         "SELECT openalex_author_id FROM people WHERE id = ?", (authorship["person_id"],)
     ).fetchone()
     assert person["openalex_author_id"] == "A2"
+
+
+@respx.mock
+def test_institution_with_missing_display_name_falls_back_to_openalex_id(tmp_path):
+    """institutions.name is NOT NULL; a missing display_name must not abort the run.
+
+    Storing the OpenAlex institution id as a name-of-last-resort (mirroring the
+    fallback the id/slug already uses) keeps the person linked to a real
+    institution row instead of the whole `with conn:` block raising
+    IntegrityError and aborting an hours-long discovery run on one malformed
+    record. Task 15's resolution step later overwrites this with the
+    authoritative display name.
+    """
+    conn = connect(tmp_path / "t.db")
+    migrate(conn)
+    client = PoliteClient(SETTINGS, "me@example.com", tmp_path / "c")
+    work = _work("W1", "A1")
+    work["authorships"][0]["institutions"][0]["display_name"] = None
+    respx.get("https://api.openalex.org/works").mock(
+        return_value=httpx.Response(200, json=_page([work], None))
+    )
+    discover(conn, client, ["T10028"], ["KR"], 2021, "k")
+    assert conn.execute("SELECT COUNT(*) FROM institutions").fetchone()[0] == 1
+    institution = conn.execute("SELECT id, name FROM institutions").fetchone()
+    assert institution["name"] == "I1"
+    person = conn.execute(
+        "SELECT institution_id FROM people WHERE openalex_author_id = 'A1'"
+    ).fetchone()
+    assert person["institution_id"] == institution["id"]
