@@ -5,7 +5,7 @@ import pytest
 import respx
 
 from gradpath.models import Settings
-from gradpath.net.http import PoliteClient
+from gradpath.net.http import HostBlocked, PoliteClient
 
 SETTINGS = Settings(
     embedding_model="m", embedding_batch_size=8, rate_limit_per_host=1000.0,
@@ -90,3 +90,50 @@ def test_robots_fetch_is_paced_through_rate_limiter(client):
     client._limiter.wait = Mock(wraps=client._limiter.wait)
     client.allowed("https://site3.example.com/staff")
     client._limiter.wait.assert_called_once_with("site3.example.com")
+
+
+@respx.mock
+def test_robots_fetch_failure_degrades_to_allowed(client):
+    # A network-level failure fetching robots.txt must never disable content
+    # fetching for the host -- it degrades to "allowed", exactly like an
+    # absent (404) robots.txt does.
+    respx.get("https://site4.example.com/robots.txt").mock(
+        side_effect=httpx.ConnectError("boom")
+    )
+    respx.get("https://site4.example.com/staff").mock(
+        return_value=httpx.Response(200, text="ok")
+    )
+    assert client.get_text("https://site4.example.com/staff") == "ok"
+
+
+@respx.mock
+def test_retry_after_http_date_falls_back_to_default_backoff(client, monkeypatch):
+    # Retry-After may legally be an HTTP-date (RFC 7231), not just a number
+    # of seconds. That must degrade to the default backoff rather than
+    # raising ValueError out of the retry path.
+    monkeypatch.setattr("gradpath.net.http.time.sleep", lambda _seconds: None)
+    respx.get("https://api.example.com/w429").mock(
+        side_effect=[
+            httpx.Response(429, headers={"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"}),
+            httpx.Response(200, json={"ok": 1}),
+        ]
+    )
+    assert client.get_json("https://api.example.com/w429") == {"ok": 1}
+
+
+@respx.mock
+def test_circuit_breaks_host_after_repeated_failures(client, monkeypatch):
+    monkeypatch.setattr("gradpath.net.http.time.sleep", lambda _seconds: None)
+    route = respx.get("https://api.example.com/broken").mock(
+        return_value=httpx.Response(503)
+    )
+    # Each call exhausts MAX_ATTEMPTS retries and counts as one failure
+    # against the host; CIRCUIT_BREAK_FAILURES=5 such calls trip the breaker.
+    for _ in range(5):
+        with pytest.raises(HostBlocked):
+            client.get_json("https://api.example.com/broken")
+    calls_before_trip = route.call_count
+    with pytest.raises(HostBlocked):
+        client.get_json("https://api.example.com/broken")
+    # The tripped breaker must short-circuit before making any request.
+    assert route.call_count == calls_before_trip

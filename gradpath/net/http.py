@@ -73,17 +73,37 @@ class PoliteClient:
                     parser.parse(response.text.splitlines())
                 else:
                     parser = None  # absent robots.txt means unrestricted
-            except httpx.HTTPError:
-                # A single attempt only: an unreachable robots.txt already
-                # has a defined meaning (unrestricted), and this must never
-                # retry or count against the host's circuit-breaker budget,
-                # or a down robots endpoint would disable content fetching.
+            except Exception:  # noqa: BLE001 -- deliberately broad, see below
+                # A single attempt only: an unreachable OR unparseable
+                # robots.txt already has a defined meaning (unrestricted),
+                # and this must never retry or count against the host's
+                # circuit-breaker budget, or a down/broken robots endpoint
+                # would disable content fetching. Deliberately broad --
+                # any robots failure (transport, or a bad parse) degrades
+                # to "allowed" rather than propagating.
                 parser = None
             self._robots[origin] = parser
         parser = self._robots[origin]
         return True if parser is None else parser.can_fetch(self.user_agent, url)
 
     # --- fetching ----------------------------------------------------------
+
+    @staticmethod
+    def _retry_after_seconds(response: httpx.Response) -> float:
+        """Parse Retry-After as seconds, falling back on the default backoff.
+
+        RFC 7231 also permits Retry-After to be an HTTP-date rather than a
+        number of seconds. Parsing that form is not needed: on any value we
+        cannot read as a number, degrade to BACKOFF_BASE_SECONDS instead of
+        letting ValueError abort a multi-hour crawl on an arbitrary header.
+        """
+        raw = response.headers.get("Retry-After")
+        if raw is None:
+            return BACKOFF_BASE_SECONDS
+        try:
+            return float(raw)
+        except ValueError:
+            return BACKOFF_BASE_SECONDS
 
     def _request(self, url: str, params: dict | None) -> httpx.Response:
         host = urlparse(url).netloc
@@ -99,7 +119,7 @@ class PoliteClient:
                 time.sleep(BACKOFF_BASE_SECONDS * (2**attempt))
                 continue
             if response.status_code == 429:
-                time.sleep(float(response.headers.get("Retry-After", BACKOFF_BASE_SECONDS)))
+                time.sleep(self._retry_after_seconds(response))
                 continue
             if response.status_code >= 500:
                 time.sleep(BACKOFF_BASE_SECONDS * (2**attempt))
