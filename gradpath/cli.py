@@ -163,6 +163,36 @@ def fields_list() -> None:
         console.print(f"{slug}\t{definition.label}\t{','.join(definition.topics)}")
 
 
+def _resolve_institution_ids(conn: sqlite3.Connection, raw: list[str]) -> list[str]:
+    """Accept either a seeded institution slug or a raw OpenAlex id, unchanged.
+
+    A value that matches a row in `institutions` is treated as a slug: its
+    resolved openalex_id is substituted so `--institution kaist` works
+    without the caller ever knowing KAIST's OpenAlex id. A slug that is
+    known but not yet resolved fails loudly (ruling R35) rather than
+    silently dropping that institution from the run -- run
+    `gradpath institutions top` (or another resolution pass) first. A value
+    that matches no seeded slug is assumed to already be a raw OpenAlex id
+    and is passed through unchanged.
+    """
+    resolved: list[str] = []
+    for value in raw:
+        row = conn.execute(
+            "SELECT openalex_id FROM institutions WHERE id = ?", (value,)
+        ).fetchone()
+        if row is None:
+            resolved.append(value)
+            continue
+        if not row["openalex_id"]:
+            console.print(
+                f"[red]institution '{value}' has no resolved OpenAlex id yet — "
+                f"run `gradpath institutions top` first[/red]"
+            )
+            raise typer.Exit(code=1)
+        resolved.append(row["openalex_id"])
+    return resolved
+
+
 @app.command()
 def discover(
     field: Annotated[
@@ -173,13 +203,21 @@ def discover(
     ] = None,
     institution: Annotated[
         list[str] | None,
-        typer.Option("--institution", help="OpenAlex institution id(s); overrides --country"),
+        typer.Option(
+            "--institution",
+            help="Seeded institution slug(s) (e.g. 'kaist') or raw OpenAlex "
+                 "institution id(s); overrides --country",
+        ),
+    ] = None,
+    tier: Annotated[
+        str | None,
+        typer.Option("--tier", help="Restrict to a seeded tier's resolved OpenAlex ids"),
     ] = None,
     since: Annotated[
         int | None, typer.Option("--since", help="Earliest publication year")
     ] = None,
 ) -> None:
-    """Find researchers. Field-first by default; --institution targets a fixed list."""
+    """Find researchers. Field-first by default; --institution/--tier target a fixed list."""
     settings, profile, conn, client = _context()
     definitions = load_fields(_paths()["fields"])
     names = field or profile.fields
@@ -191,10 +229,25 @@ def discover(
 
     countries = [c.upper() for c in (country or profile.countries)]
     since_year = since or settings.default_since_year
+
+    institution_ids = _resolve_institution_ids(conn, list(institution)) if institution else None
+    if institution_ids is None and tier:
+        rows = conn.execute(
+            "SELECT openalex_id FROM institutions WHERE tier = ? AND openalex_id IS NOT NULL",
+            (tier,),
+        ).fetchall()
+        if not rows:
+            console.print(
+                f"[red]tier '{tier}' has no institutions with a resolved OpenAlex id — "
+                f"run `gradpath institutions top` first[/red]"
+            )
+            raise typer.Exit(code=1)
+        institution_ids = [row["openalex_id"] for row in rows]
+
     key = f"discover:{'|'.join(sorted(topics))}:{'|'.join(sorted(countries))}:{since_year}"
     stats = run_discover(
         conn, client, topics, countries, since_year, key,
-        list(institution) if institution else None,
+        institution_ids,
     )
     console.print(
         f"[green]{stats.works_seen}[/green] works, "
@@ -488,6 +541,54 @@ def institutions_list(
         sql += " WHERE discovered = 1"
     for row in conn.execute(sql + " ORDER BY name"):
         console.print(f"{row['id']}\t{row['country'] or '--'}\t{row['name']}")
+
+
+@institutions_app.command("top")
+def institutions_top(
+    country: Annotated[str, typer.Option("--country", help="ISO country code, e.g. KR")],
+    limit: Annotated[int, typer.Option("--limit", help="How many institutions to seed")] = 20,
+    metric: Annotated[
+        str, typer.Option("--metric", help="cited_by_count or works_count")
+    ] = "cited_by_count",
+    tier: Annotated[
+        str | None, typer.Option("--tier", help="Tier label; defaults to '<country>-<limit>'")
+    ] = None,
+) -> None:
+    """Seed the highest-output institutions in a country from OpenAlex.
+
+    This is also how resolution happens for institutions already seeded from
+    data/institutions.yaml: an already-known row (matched by homepage
+    domain) gets its openalex_id filled in here, without disturbing its
+    curated adapter. See gradpath/sources/institutions.py.
+    """
+    from gradpath.sources.institutions import top_institutions, upsert_institutions
+
+    _, _, conn, client = _context()
+    hits = top_institutions(client, country, limit, metric)
+    label = tier or f"{country.lower()}-{limit}"
+    count = upsert_institutions(conn, hits, label, f"openalex:{metric}")
+    console.print(f"[green]seeded {count}[/green] institutions as tier '{label}'")
+    for position, hit in enumerate(hits, start=1):
+        console.print(f"{position:>3}  {hit.name}")
+
+
+@institutions_app.command("import")
+def institutions_import(
+    csv_path: Annotated[Path, typer.Option("--csv", help="rank,name,country columns")],
+    tier: Annotated[str, typer.Option("--tier", help="Tier label, e.g. world-100")],
+    top: Annotated[int, typer.Option("--top", help="Only import the top N rows")] = 100,
+) -> None:
+    """Import a QS/THE/ARWU ranking snapshot. See data/rankings/README.md.
+
+    OpenAlex ids are left unresolved here -- `gradpath institutions top` over
+    the matching country later binds them by homepage domain, once the
+    curated data has a site to match against.
+    """
+    from gradpath.sources.institutions import import_ranking_csv
+
+    _, _, conn, _ = _context()
+    count = import_ranking_csv(conn, csv_path, tier, top)
+    console.print(f"[green]imported {count}[/green] institutions as tier '{tier}'")
 
 
 if __name__ == "__main__":

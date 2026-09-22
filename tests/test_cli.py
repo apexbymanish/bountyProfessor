@@ -136,15 +136,105 @@ def test_unknown_field_gives_an_actionable_error(tmp_path):
     assert "fields search" in result.stdout
 
 
-def test_discover_has_no_tier_option(tmp_path):
-    """R: --tier belongs to Task 15, not this one. discover must not expose it."""
+# --- Task 15: --tier and slug-accepting --institution on `discover` ---
+
+
+@respx.mock
+def test_discover_tier_resolves_seeded_institutions(tmp_path):
+    """--tier restricts a run to a seeded tier's resolved OpenAlex ids."""
+    from gradpath.db import connect, migrate
+
+    workspace = _workspace(tmp_path)
+    runner.invoke(app, ["--root", str(workspace), "init"])
+    conn = connect(workspace / "gradpath.db")
+    migrate(conn)
+    conn.execute(
+        "INSERT INTO institutions (id, name, openalex_id, tier, rank, added_at) "
+        "VALUES ('kaist', 'KAIST', 'I1', 'korea-20', 1, '2026-01-01')"
+    )
+    conn.commit()
+    route = respx.get("https://api.openalex.org/works").mock(
+        return_value=httpx.Response(200, json={"results": [], "meta": {"next_cursor": None}})
+    )
+    result = runner.invoke(
+        app, ["--root", str(workspace), "discover", "--field", "efficient-ml", "--tier", "korea-20"]
+    )
+    assert result.exit_code == 0
+    assert "institutions.id:I1" in route.calls[0].request.url.params["filter"]
+
+
+def test_discover_tier_with_no_resolved_institutions_fails_clearly(tmp_path):
     workspace = _workspace(tmp_path)
     runner.invoke(app, ["--root", str(workspace), "init"])
     result = runner.invoke(
-        app, ["--root", str(workspace), "discover", "--tier", "top20"]
+        app, ["--root", str(workspace), "discover", "--field", "efficient-ml", "--tier", "korea-20"]
     )
     assert result.exit_code != 0
-    assert "no such option" in result.output.lower()
+    normalized = " ".join(result.output.lower().split())
+    assert "korea-20" in normalized
+    assert "institutions top" in normalized
+
+
+@respx.mock
+def test_discover_institution_accepts_a_seeded_slug(tmp_path):
+    from gradpath.db import connect, migrate
+
+    workspace = _workspace(tmp_path)
+    runner.invoke(app, ["--root", str(workspace), "init"])
+    conn = connect(workspace / "gradpath.db")
+    migrate(conn)
+    conn.execute(
+        "INSERT INTO institutions (id, name, openalex_id, added_at) "
+        "VALUES ('kaist', 'KAIST', 'I1', '2026-01-01')"
+    )
+    conn.commit()
+    route = respx.get("https://api.openalex.org/works").mock(
+        return_value=httpx.Response(200, json={"results": [], "meta": {"next_cursor": None}})
+    )
+    result = runner.invoke(
+        app,
+        ["--root", str(workspace), "discover", "--field", "efficient-ml", "--institution", "kaist"],
+    )
+    assert result.exit_code == 0
+    assert "institutions.id:I1" in route.calls[0].request.url.params["filter"]
+
+
+@respx.mock
+def test_discover_institution_passes_through_a_raw_openalex_id(tmp_path):
+    """A value that is not a known seeded slug is treated as a raw OpenAlex id."""
+    workspace = _workspace(tmp_path)
+    runner.invoke(app, ["--root", str(workspace), "init"])
+    route = respx.get("https://api.openalex.org/works").mock(
+        return_value=httpx.Response(200, json={"results": [], "meta": {"next_cursor": None}})
+    )
+    result = runner.invoke(
+        app,
+        ["--root", str(workspace), "discover", "--field", "efficient-ml", "--institution", "I999"],
+    )
+    assert result.exit_code == 0
+    assert "institutions.id:I999" in route.calls[0].request.url.params["filter"]
+
+
+def test_discover_institution_rejects_a_seeded_slug_with_no_resolved_id(tmp_path):
+    """R35: an unresolved slug must fail loudly, not silently return nothing."""
+    from gradpath.db import connect, migrate
+
+    workspace = _workspace(tmp_path)
+    runner.invoke(app, ["--root", str(workspace), "init"])
+    conn = connect(workspace / "gradpath.db")
+    migrate(conn)
+    conn.execute(
+        "INSERT INTO institutions (id, name, added_at) VALUES ('mit', 'MIT', '2026-01-01')"
+    )
+    conn.commit()
+    result = runner.invoke(
+        app,
+        ["--root", str(workspace), "discover", "--field", "efficient-ml", "--institution", "mit"],
+    )
+    assert result.exit_code != 0
+    normalized = " ".join(result.output.lower().split())
+    assert "mit" in normalized
+    assert "institutions top" in normalized
 
 
 # --- R27: faculty score must use whole-career data, and say when it didn't ---
@@ -458,3 +548,61 @@ def test_malformed_profile_gives_a_clean_error_not_a_traceback(tmp_path):
     assert result.exception is None or not isinstance(result.exception, ValueError)
     assert "traceback" not in result.output.lower()
     assert "profile.yaml" in result.output.lower()
+
+
+# --- Task 15: `institutions top`/`institutions import` CLI wiring ---
+
+
+@respx.mock
+def test_institutions_top_cli_seeds_and_labels_a_tier(tmp_path):
+    workspace = _workspace(tmp_path, institutions_yaml=INSTITUTIONS_YAML)
+    runner.invoke(app, ["--root", str(workspace), "init"])
+    respx.get("https://api.openalex.org/institutions").mock(
+        return_value=httpx.Response(200, json={"results": [{
+            "id": "https://openalex.org/I1", "ror": "https://ror.org/01abcde",
+            "display_name": "KAIST", "country_code": "KR",
+            "homepage_url": "https://kaist.ac.kr",
+            "works_count": 100, "cited_by_count": 100,
+        }]})
+    )
+    result = runner.invoke(
+        app,
+        ["--root", str(workspace), "institutions", "top",
+         "--country", "KR", "--limit", "1", "--tier", "korea-20"],
+    )
+    assert result.exit_code == 0
+    assert "korea-20" in result.output
+
+    from gradpath.db import connect
+
+    conn = connect(workspace / "gradpath.db")
+    row = conn.execute(
+        "SELECT id, adapter, tier FROM institutions WHERE openalex_id = 'I1'"
+    ).fetchone()
+    assert row["id"] == "kaist"  # matched the seeded row by homepage domain
+    assert row["adapter"] == "kaist"  # preserved, not overwritten
+    assert row["tier"] == "korea-20"
+
+
+def test_institutions_import_cli_seeds_a_csv_snapshot(tmp_path):
+    workspace = _workspace(tmp_path)
+    runner.invoke(app, ["--root", str(workspace), "init"])
+    csv_path = workspace / "snapshot.csv"
+    csv_path.write_text("rank,name,country\n1,Massachusetts Institute of Technology,US\n")
+    result = runner.invoke(
+        app,
+        ["--root", str(workspace), "institutions", "import",
+         "--csv", str(csv_path), "--tier", "world-100", "--top", "100"],
+    )
+    assert result.exit_code == 0
+    assert "world-100" in result.output
+
+    from gradpath.db import connect
+
+    conn = connect(workspace / "gradpath.db")
+    row = conn.execute(
+        "SELECT tier, openalex_id FROM institutions WHERE name = "
+        "'Massachusetts Institute of Technology'"
+    ).fetchone()
+    assert row["tier"] == "world-100"
+    assert row["openalex_id"] is None

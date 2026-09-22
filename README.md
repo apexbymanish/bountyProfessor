@@ -11,10 +11,9 @@ publishing in that area from OpenAlex, scores each one against your interests, e
 actually faculty rather than a PhD student, resolves contact addresses from authoritative
 sources, and gives you a ranked shortlist with the evidence behind every row.
 
-> **Status: in progress.** The library and the `gradpath` CLI are built and tested (150+
-> tests). The one thing not yet built is institution-tier seeding (scoping a run to, say,
-> Korea's top 20 or the world top 100) — until then, `discover` is field-and-country-first.
-> See [Current state](#current-state).
+> **Status: feature-complete.** The library and the `gradpath` CLI are built and tested (170+
+> tests), including the seeded institution registry and tier-scoped discovery. See
+> [Current state](#current-state) for what remains genuinely unverified.
 
 ## What makes it different
 
@@ -64,10 +63,13 @@ Working and tested: the SQLite schema and migrations, config and profile loading
 HTTP layer, OpenAlex parsing and ingest (resumable, crash-safe), fit scoring, faculty-likelihood
 scoring, the persisted embedding cache and uncapped matching, Crossref/ORCID/career enrichment,
 the email resolution chain, three institution adapters, budget-gated LLM reranking,
-reporting/export, and the `gradpath` CLI that wires all of it into one command.
+reporting/export, the seeded institution registry (OpenAlex-sourced tiers and cited ranking-CSV
+imports, with domain-based resolution onto curated rows), tier-scoped discovery, and the
+`gradpath` CLI that wires all of it into one command.
 
-Not yet built: institution-tier seeding, which will let `discover` scope a run to a named
-tier (say, Korea's top 20 or the world top 100) instead of just a field and a country list.
+Not yet built: nothing in the original plan. What remains is verification, not features (see
+the known limitation below), and any ranking snapshot a user wants to import stays theirs to
+supply and cite — `gradpath` intentionally ships none.
 
 Verified against live OpenAlex: a one-page discovery run returned 200 works, 1,039 researchers
 across 299 institutions, embedded and scored end to end in under two seconds.
@@ -124,6 +126,11 @@ gradpath fields search "efficient machine learning"
 # 3. Discover researchers publishing in a field, in the countries you care about.
 gradpath discover --field efficient-ml --country KR --since 2018
 
+# 3b. Or scope discovery to a fixed institution list instead of a whole country
+#     (see "Scoping a run to a tier" below for how korea-20/--institution get set up).
+gradpath discover --field efficient-ml --tier korea-20
+gradpath discover --field efficient-ml --institution kaist --institution gist
+
 # 4. Score everyone against your interests (fit). No top-N — everyone found is scored.
 gradpath match
 
@@ -156,6 +163,42 @@ gradpath export --csv targets.csv
 export ANTHROPIC_API_KEY=...
 gradpath match --rerank --min-score 0.7 --budget 2.00
 ```
+
+## Scoping a run to a tier
+
+Discovery is field-first by design — institutions are *discovered from the results*, which is
+how it surfaces the excellent lab nobody told you about. But a real applicant also wants to say
+"only places I could plausibly attend." Tiers provide that without reintroducing a cap on who
+gets scored: they restrict *which institutions get queried*, not how many people from them get
+ranked.
+
+Ranks are never hand-typed into this repository — they change every year and the major
+rankings disagree. There are exactly two sourced ways to build a tier:
+
+```bash
+# Live OpenAlex research output — reproducible, current by construction, needs no file.
+gradpath institutions top --country KR --limit 20 --tier korea-20
+
+# A QS/THE/ARWU snapshot you supply and can cite. See data/rankings/README.md — snapshots
+# are never committed to this repo, and OpenAlex ids are resolved separately (below).
+gradpath institutions import --csv data/rankings/qs2026.csv --tier world-100 --top 100
+```
+
+`institutions top` also *resolves*: a curated row already seeded from `data/institutions.yaml`
+(with its adapter) is matched by homepage domain and gets its OpenAlex id filled in, rather
+than being duplicated under a name-derived slug. Run it again for a CSV-imported tier's
+countries to resolve those rows the same way.
+
+Once a tier has institutions with resolved OpenAlex ids, scope discovery to it:
+
+```bash
+gradpath discover --field efficient-ml --tier korea-20
+```
+
+`--institution` accepts either a seeded slug (e.g. `kaist`, resolved via the `institutions`
+table) or a raw OpenAlex institution id, passed through unchanged. A slug with no resolved
+OpenAlex id yet fails with a message telling you to run `gradpath institutions top` first,
+rather than silently discovering nothing for it.
 
 ## License
 

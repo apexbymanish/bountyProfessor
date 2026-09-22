@@ -3,7 +3,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 MIGRATIONS: dict[int, str] = {
     1: """
@@ -78,6 +78,17 @@ MIGRATIONS: dict[int, str] = {
     ALTER TABLE people ADD COLUMN career_first_year INTEGER;
     ALTER TABLE people ADD COLUMN career_last_year INTEGER;
     ALTER TABLE people ADD COLUMN career_works_count INTEGER;
+    """,
+    # tier/rank/rank_source let a run scope itself to a seeded institution
+    # registry (e.g. "korea-20", "world-100") without reintroducing a cap on
+    # who gets scored -- see gradpath/sources/institutions.py. rank is only
+    # ever assigned by list order from a live OpenAlex query or by a
+    # ranking CSV the user supplies; it is never hand-written here.
+    4: """
+    ALTER TABLE institutions ADD COLUMN tier TEXT;
+    ALTER TABLE institutions ADD COLUMN rank INTEGER;
+    ALTER TABLE institutions ADD COLUMN rank_source TEXT;
+    CREATE INDEX idx_institutions_tier ON institutions(tier, rank);
     """,
 }
 

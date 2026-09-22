@@ -5,6 +5,10 @@ profile.yaml
 .cache/
 out/
 
+# ranking snapshots are third-party data — never commit; see data/rankings/README.md
+data/rankings/*.csv
+data/rankings/*.source
+
 # python
 __pycache__/
 *.py[cod]
