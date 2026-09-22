@@ -16,3 +16,6 @@ venv/
 
 # os
 .DS_Store
+
+# sdd scratch
+.superpowers/
