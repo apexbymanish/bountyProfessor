@@ -107,7 +107,7 @@ gradpath/
     fields.yaml               field -> OpenAlex topic id mappings
   tests/
     fixtures/
-    cassettes/
+    fixtures/
   docs/
 ```
 
@@ -523,7 +523,7 @@ loses the users who would otherwise try it.
 
 ## Testing
 
-- `pytest`, with `vcrpy` cassettes for every HTTP interaction. No test touches
+- `pytest`, with `respx` mocks for every HTTP interaction. No test touches
   the live network.
 - Fixtures: a trimmed OpenAlex topic-filtered works response, a Crossref
   record, an ORCID record, and one saved faculty-directory page per seeded
