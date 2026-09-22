@@ -1,0 +1,17 @@
+kaist:
+  name: Korea Advanced Institute of Science and Technology
+  country: KR
+  site: kaist.ac.kr
+  adapter: kaist
+
+gist:
+  name: Gwangju Institute of Science and Technology
+  country: KR
+  site: gist.ac.kr
+  adapter: gist
+
+snu:
+  name: Seoul National University
+  country: KR
+  site: snu.ac.kr
+  adapter: snu

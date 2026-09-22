@@ -1,0 +1,4 @@
+efficient-ml:
+  label: Efficient machine learning
+  topics: [T10028, T11689]
+  aliases: [edge-ml, on-device-ml]

@@ -1,0 +1,8 @@
+embedding_model: sentence-transformers/all-MiniLM-L6-v2
+embedding_batch_size: 256
+rate_limit_per_host: 1.0
+default_since_year: 2021
+show_min_score: 0.65
+rerank_model: claude-opus-5
+rerank_default_budget_usd: 2.00
+cache_dir: .cache
