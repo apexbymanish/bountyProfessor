@@ -73,7 +73,7 @@ def embed_pending_works(
                 conn.execute(
                     "INSERT OR REPLACE INTO embeddings "
                     "(work_id, model, dim, vector, source, computed_at) VALUES (?,?,?,?,?,?)",
-                    (row["id"], model, int(len(vector)), pack(vector), source, now_iso()),
+                    (row["id"], model, len(vector), pack(vector), source, now_iso()),
                 )
                 added += 1
     return added

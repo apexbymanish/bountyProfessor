@@ -3,7 +3,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 MIGRATIONS: dict[int, str] = {
     1: """
@@ -54,6 +54,21 @@ MIGRATIONS: dict[int, str] = {
     CREATE INDEX idx_matches_score ON matches(profile_id, stage1_score DESC);
     CREATE INDEX idx_people_faculty ON people(faculty_confidence, faculty_score DESC);
     CREATE INDEX idx_works_year ON works(year);
+    """,
+    2: """
+    CREATE TABLE embeddings_new (
+        work_id INTEGER NOT NULL REFERENCES works(id),
+        model TEXT NOT NULL,
+        dim INTEGER NOT NULL,
+        vector BLOB NOT NULL,
+        source TEXT NOT NULL,
+        computed_at TEXT NOT NULL,
+        PRIMARY KEY (work_id, model)
+    );
+    INSERT INTO embeddings_new (work_id, model, dim, vector, source, computed_at)
+    SELECT work_id, model, dim, vector, source, computed_at FROM embeddings;
+    DROP TABLE embeddings;
+    ALTER TABLE embeddings_new RENAME TO embeddings;
     """,
 }
 

@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 
 def now_iso() -> str:
     """Current UTC time as an ISO-8601 string. The only clock in the codebase."""
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return datetime.now(UTC).isoformat(timespec="seconds")
 
 
 def slugify(text: str) -> str:

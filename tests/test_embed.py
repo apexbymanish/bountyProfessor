@@ -3,7 +3,11 @@ import pytest
 
 from gradpath.db import connect, migrate
 from gradpath.match.embed import (
-    build_profile_vector, embed_pending_works, pack, run_match, unpack,
+    build_profile_vector,
+    embed_pending_works,
+    pack,
+    run_match,
+    unpack,
 )
 from gradpath.models import Profile
 from tests.conftest import FakeEmbedder
@@ -116,6 +120,33 @@ def test_build_profile_vector_weights_seed_abstracts_double():
     without = build_profile_vector(profile, [], embedder)
     with_seed = build_profile_vector(profile, ["beta beta beta"], embedder)
     assert not np.allclose(without, with_seed)
+
+
+def test_two_models_can_embed_the_same_work_without_evicting_each_other(db):
+    _add_work(db, "W1", "t", "a")
+    db.commit()
+    embed_pending_works(db, FakeEmbedder(), "model-a", batch_size=8)
+    embed_pending_works(db, FakeEmbedder(), "model-b", batch_size=8)
+    rows = db.execute("SELECT model FROM embeddings ORDER BY model").fetchall()
+    assert [row["model"] for row in rows] == ["model-a", "model-b"]
+
+
+def test_embed_pending_works_under_second_model_preserves_first_models_rows(db):
+    _add_work(db, "W1", "t", "a")
+    db.commit()
+    embed_pending_works(db, FakeEmbedder(), "model-a", batch_size=8)
+    before = db.execute(
+        "SELECT vector, computed_at FROM embeddings WHERE model = 'model-a'"
+    ).fetchone()
+
+    assert embed_pending_works(db, FakeEmbedder(), "model-b", batch_size=8) == 1
+
+    after = db.execute(
+        "SELECT vector, computed_at FROM embeddings WHERE model = 'model-a'"
+    ).fetchone()
+    assert after["vector"] == before["vector"]
+    assert after["computed_at"] == before["computed_at"]
+    assert db.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0] == 2
 
 
 def test_build_profile_vector_refuses_when_nothing_resolves():

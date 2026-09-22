@@ -3,7 +3,11 @@ from urllib.parse import urlparse
 import pytest
 
 from gradpath.config import (
-    load_fields, load_institutions, load_profile, load_settings, resolve_field,
+    load_fields,
+    load_institutions,
+    load_profile,
+    load_settings,
+    resolve_field,
     scaffold_profile,
 )
 
