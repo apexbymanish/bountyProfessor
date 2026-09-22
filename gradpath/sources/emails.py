@@ -3,7 +3,7 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass
 
-from gradpath.net.http import PoliteClient
+from gradpath.net.http import HostBlocked, PoliteClient
 from gradpath.sources.adapters import get_adapter
 from gradpath.sources.crawler import crawl_faculty_email, extract_emails
 from gradpath.sources.crossref import crossref_email
@@ -45,7 +45,10 @@ def _adapter_email(
     adapter = adapter_cls()
     surname = person_row["name"].split()[-1].lower()
     for url in adapter.faculty_urls():
-        html = client.get_text(url)
+        try:
+            html = client.get_text(url)
+        except HostBlocked:
+            continue
         if html is None:
             continue
         for record in adapter.parse_faculty(html, url):

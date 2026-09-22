@@ -4,7 +4,7 @@ import respx
 
 from gradpath.db import connect, migrate
 from gradpath.models import Settings
-from gradpath.net.http import PoliteClient
+from gradpath.net.http import HostBlocked, PoliteClient
 from gradpath.sources.emails import resolve_email
 
 SETTINGS = Settings("m", 8, 1000.0, 2021, 0.6, "claude-opus-5", 1.0, ".cache")
@@ -117,3 +117,50 @@ def test_registered_adapters_satisfy_the_contract():
         assert isinstance(adapter_cls.domains, list) and adapter_cls.domains
         assert callable(adapter_cls.faculty_urls)
         assert callable(adapter_cls.parse_faculty)
+
+
+def test_adapter_host_blocked_degrades_instead_of_propagating(db, client, monkeypatch):
+    """A circuit-broken faculty-directory host must degrade the chain, not abort it.
+
+    Every other step in resolve_email (crossref, orcid, crawler) guards HostBlocked
+    internally. _adapter_email must do the same: a host that has circuit-broken
+    after repeated failures should fall through to the crawler step (or to "none"),
+    never propagate out of resolve_email and abort a long resolution run.
+    """
+    from typing import ClassVar
+
+    from gradpath.sources.adapters import _REGISTRY
+    from gradpath.sources.adapters.base import InstitutionAdapter
+
+    class _BlockedAdapter(InstitutionAdapter):
+        slug = "test-hostblocked"
+        domains: ClassVar[list[str]] = ["blocked.example.com"]
+
+        def faculty_urls(self):
+            return ["https://blocked.example.com/faculty"]
+
+        def parse_faculty(self, html, url):
+            return []
+
+    monkeypatch.setitem(_REGISTRY, _BlockedAdapter.slug, _BlockedAdapter)
+
+    def _raise(url):
+        raise HostBlocked("blocked")
+
+    monkeypatch.setattr(client, "get_text", _raise)
+
+    db.execute(
+        "INSERT INTO institutions (id, name, added_at, adapter) VALUES "
+        "('i2', 'Blocked Institution', '2026-01-01', 'test-hostblocked')"
+    )
+    db.execute(
+        "INSERT INTO people (id, institution_id, name, openalex_author_id) "
+        "VALUES (2, 'i2', 'No Homepage Person', 'A2')"
+    )
+    db.commit()
+
+    person_row = db.execute("SELECT * FROM people WHERE id = 2").fetchone()
+    result = resolve_email(db, client, person_row)
+
+    assert result.email is None
+    assert result.confidence == "none"

@@ -18,12 +18,8 @@ def all_adapters() -> list[type[InstitutionAdapter]]:
     return list(_REGISTRY.values())
 
 
-# Importing the modules is what registers them. These land in Task 11; until
-# then this package must still import cleanly (Task 10 ships with no
-# adapters registered, which tests/test_email_chain.py's
-# test_registered_adapters_satisfy_the_contract documents as an expected,
-# cross-task failure).
-try:
-    from gradpath.sources.adapters import gist, kaist, snu  # noqa: F401
-except ImportError:
-    pass
+# Importing the modules is what registers them. A genuine ImportError here
+# (a typo, a bad import inside an adapter module) must raise loudly: swallowing
+# it would silently drop that institution's adapter and let resolution fall
+# through to the weaker generic crawler with no visible symptom.
+from gradpath.sources.adapters import gist, kaist, snu  # noqa: F401
