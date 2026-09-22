@@ -476,6 +476,33 @@ limits more important than in rev 1, not less. Crawling is deliberately gated
 behind `--min-score` so that breadth of discovery does not become breadth of
 crawling.
 
+## Institution tiers and seeding
+
+Discovery is field-first, but an applicant usually also wants to scope a run to
+a realistic set of universities — "Korea's top 20", "the world top 100". The
+`institutions` table therefore carries `tier`, `rank` and `rank_source`, and
+`discover --tier <name>` restricts a run to a seeded tier.
+
+Ranks are never hand-written into the repository. They change every year and
+the major rankings disagree with each other, so a typed list would be stale on
+arrival and unverifiable. Two sourced paths instead:
+
+- `gradpath institutions top --country KR --limit 20 --tier korea-20` orders
+  institutions by live OpenAlex output (`cited_by_count` or `works_count`).
+  Reproducible, current by construction, no external file, and it needs no
+  ranking publisher's permission.
+- `gradpath institutions import --csv <path> --tier world-100 --top 100`
+  imports a QS, THE or ARWU snapshot for anyone who wants literal published
+  ranks. Snapshots are not committed — they are third-party data — and
+  `data/rankings/README.md` records the expected columns and where to obtain
+  them, with a sibling `.source` file recording provenance and retrieval date
+  so any imported rank can be cited.
+
+An import never invents an OpenAlex identifier it cannot verify: CSV rows land
+with `openalex_id` NULL and are resolved separately. Seeding also never
+overwrites an adapter bound by hand, so re-seeding cannot undo a contributor's
+mapping.
+
 ## Institution adapters
 
 ```python

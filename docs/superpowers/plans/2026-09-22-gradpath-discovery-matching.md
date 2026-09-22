@@ -3797,12 +3797,398 @@ git commit -m "feat: CLI wiring and end-to-end pipeline"
 
 ---
 
+---
+
+### Task 15: Seeded institution registry — Korea top 20 and world top 100
+
+**Files:**
+- Modify: `gradpath/db.py` (migration 2: add `institutions.tier`, `institutions.rank`, `institutions.rank_source`)
+- Create: `gradpath/sources/institutions.py`
+- Create: `data/rankings/README.md`
+- Modify: `gradpath/cli.py` (add `institutions top`, `institutions import`, `--tier` on `discover`)
+- Test: `tests/test_institutions.py`
+
+**Why this shape.** Rankings change every year and disagree between QS, THE and ARWU, so a hand-typed list of 100 rows with ranks would be stale on arrival and impossible to verify. Two sourced paths instead: OpenAlex for research-output ordering that is always current and needs no external file, and a CSV import for anyone who wants literal QS or THE ranks from a snapshot they can cite.
+
+**Interfaces:**
+- Consumes: `PoliteClient`, `OPENALEX_BASE`, `slugify`, `now_iso`
+- Produces: `InstitutionHit(openalex_id, ror_id, name, country, site, works_count, cited_by_count)`; `top_institutions(client, country, limit, metric) -> list[InstitutionHit]`; `upsert_institutions(conn, hits, tier, rank_source) -> int`; `import_ranking_csv(conn, path, tier, top) -> int`; `SUPPORTED_METRICS`
+
+- [ ] **Step 1: Write the failing test**
+
+```python
+# tests/test_institutions.py
+import httpx
+import pytest
+import respx
+
+from gradpath.db import connect, migrate
+from gradpath.models import Settings
+from gradpath.net.http import PoliteClient
+from gradpath.sources.institutions import (
+    import_ranking_csv, top_institutions, upsert_institutions,
+)
+
+SETTINGS = Settings("m", 8, 1000.0, 2021, 0.6, "claude-opus-5", 1.0, ".cache")
+
+
+def _payload(names: list[str], country: str = "KR") -> dict:
+    return {"results": [
+        {
+            "id": f"https://openalex.org/I{index}",
+            "ror": f"https://ror.org/0{index}abcde",
+            "display_name": name,
+            "country_code": country,
+            "homepage_url": f"https://{name.lower().replace(' ', '')}.ac.kr",
+            "works_count": 10_000 - index,
+            "cited_by_count": 500_000 - index,
+        }
+        for index, name in enumerate(names)
+    ]}
+
+
+@pytest.fixture
+def db(tmp_path):
+    conn = connect(tmp_path / "t.db")
+    migrate(conn)
+    return conn
+
+
+@pytest.fixture
+def client(tmp_path):
+    return PoliteClient(SETTINGS, "me@example.com", tmp_path / "c")
+
+
+def test_migration_two_adds_tier_columns(db):
+    columns = {r[1] for r in db.execute("PRAGMA table_info(institutions)")}
+    assert {"tier", "rank", "rank_source"} <= columns
+
+
+@respx.mock
+def test_top_institutions_requests_country_filter(client):
+    route = respx.get("https://api.openalex.org/institutions").mock(
+        return_value=httpx.Response(200, json=_payload(["SNU", "KAIST"]))
+    )
+    hits = top_institutions(client, "KR", 20, "cited_by_count")
+    assert [h.name for h in hits] == ["SNU", "KAIST"]
+    assert "country_code:kr" in route.calls[0].request.url.params["filter"]
+    assert hits[0].ror_id == "0ror" or hits[0].ror_id.startswith("0")
+
+
+@respx.mock
+def test_top_institutions_rejects_an_unsupported_metric(client):
+    with pytest.raises(ValueError, match="metric"):
+        top_institutions(client, "KR", 20, "vibes")
+
+
+@respx.mock
+def test_upsert_assigns_tier_and_rank_in_order(db, client):
+    respx.get("https://api.openalex.org/institutions").mock(
+        return_value=httpx.Response(200, json=_payload(["SNU", "KAIST", "Yonsei"]))
+    )
+    hits = top_institutions(client, "KR", 20, "cited_by_count")
+    assert upsert_institutions(db, hits, "korea-20", "openalex:cited_by_count") == 3
+    rows = db.execute(
+        "SELECT name, tier, rank, rank_source FROM institutions ORDER BY rank"
+    ).fetchall()
+    assert [r["name"] for r in rows] == ["SNU", "KAIST", "Yonsei"]
+    assert [r["rank"] for r in rows] == [1, 2, 3]
+    assert rows[0]["tier"] == "korea-20"
+    assert rows[0]["rank_source"] == "openalex:cited_by_count"
+
+
+@respx.mock
+def test_reseeding_updates_rank_without_duplicating(db, client):
+    respx.get("https://api.openalex.org/institutions").mock(
+        return_value=httpx.Response(200, json=_payload(["SNU", "KAIST"]))
+    )
+    hits = top_institutions(client, "KR", 20, "cited_by_count")
+    upsert_institutions(db, hits, "korea-20", "openalex:cited_by_count")
+    upsert_institutions(db, list(reversed(hits)), "korea-20", "openalex:cited_by_count")
+    assert db.execute("SELECT COUNT(*) FROM institutions").fetchone()[0] == 2
+    top = db.execute("SELECT name FROM institutions WHERE rank = 1").fetchone()
+    assert top["name"] == "KAIST"
+
+
+def test_upsert_preserves_a_hand_bound_adapter(db, client):
+    db.execute(
+        "INSERT INTO institutions (id, name, openalex_id, adapter, added_at) "
+        "VALUES ('kaist','KAIST','I1','kaist','2026-01-01')"
+    )
+    db.commit()
+    from gradpath.sources.institutions import InstitutionHit
+
+    hit = InstitutionHit("I1", "01ror", "KAIST", "KR", "https://kaist.ac.kr", 9, 9)
+    upsert_institutions(db, [hit], "korea-20", "openalex:cited_by_count")
+    row = db.execute("SELECT adapter, tier FROM institutions WHERE openalex_id='I1'").fetchone()
+    assert row["adapter"] == "kaist"
+    assert row["tier"] == "korea-20"
+
+
+def test_import_ranking_csv_reads_rank_and_name(db, tmp_path):
+    path = tmp_path / "qs2026.csv"
+    path.write_text(
+        "rank,name,country\n1,Massachusetts Institute of Technology,US\n"
+        "2,Imperial College London,GB\n3,Stanford University,US\n"
+    )
+    assert import_ranking_csv(db, path, "world-100", top=2) == 2
+    rows = db.execute(
+        "SELECT name, rank, tier FROM institutions ORDER BY rank"
+    ).fetchall()
+    assert [r["name"] for r in rows] == [
+        "Massachusetts Institute of Technology", "Imperial College London"
+    ]
+    assert rows[0]["tier"] == "world-100"
+
+
+def test_import_ranking_csv_rejects_a_file_missing_required_columns(db, tmp_path):
+    path = tmp_path / "bad.csv"
+    path.write_text("position,institution\n1,MIT\n")
+    with pytest.raises(ValueError, match="rank.*name"):
+        import_ranking_csv(db, path, "world-100", top=10)
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `pytest tests/test_institutions.py -v`
+Expected: FAIL — `test_migration_two_adds_tier_columns` fails on the missing `tier` column, the rest on `ModuleNotFoundError: No module named 'gradpath.sources.institutions'`
+
+- [ ] **Step 3: Write the implementation**
+
+Add migration 2 to `gradpath/db.py`, leaving migration 1 untouched, and bump `SCHEMA_VERSION` to 2:
+
+```python
+SCHEMA_VERSION = 2
+
+MIGRATIONS[2] = """
+ALTER TABLE institutions ADD COLUMN tier TEXT;
+ALTER TABLE institutions ADD COLUMN rank INTEGER;
+ALTER TABLE institutions ADD COLUMN rank_source TEXT;
+CREATE INDEX idx_institutions_tier ON institutions(tier, rank);
+"""
+```
+
+```python
+# gradpath/sources/institutions.py
+"""Seeding the institution registry from sourced data.
+
+Ranks are never typed by hand here. They come from OpenAlex, which is current
+by construction, or from a ranking CSV the user can cite. A fabricated rank in
+a seed file is worse than no rank at all.
+"""
+from __future__ import annotations
+
+import csv
+import sqlite3
+from dataclasses import dataclass
+from pathlib import Path
+
+from gradpath.net.http import PoliteClient
+from gradpath.sources.openalex import OPENALEX_BASE
+from gradpath.util import now_iso, slugify
+
+SUPPORTED_METRICS = ("cited_by_count", "works_count")
+REQUIRED_CSV_COLUMNS = {"rank", "name"}
+
+
+@dataclass(frozen=True)
+class InstitutionHit:
+    openalex_id: str
+    ror_id: str | None
+    name: str
+    country: str | None
+    site: str | None
+    works_count: int
+    cited_by_count: int
+
+
+def _short_id(url: str | None) -> str | None:
+    return url.rsplit("/", 1)[-1] if url else None
+
+
+def top_institutions(
+    client: PoliteClient, country: str, limit: int, metric: str = "cited_by_count"
+) -> list[InstitutionHit]:
+    """The highest-output institutions in a country, straight from OpenAlex.
+
+    This is what makes "Korea top 20" reproducible without trusting a stale
+    hand-written list: the ordering is recomputed from live research output.
+    """
+    if metric not in SUPPORTED_METRICS:
+        raise ValueError(f"metric must be one of {SUPPORTED_METRICS}, got {metric!r}")
+    payload = client.get_json(
+        f"{OPENALEX_BASE}/institutions",
+        {
+            "filter": f"country_code:{country.lower()},type:education",
+            "sort": f"{metric}:desc",
+            "per-page": limit,
+        },
+    )
+    return [
+        InstitutionHit(
+            openalex_id=_short_id(item.get("id")) or "",
+            ror_id=_short_id(item.get("ror")),
+            name=item.get("display_name") or "",
+            country=item.get("country_code"),
+            site=item.get("homepage_url"),
+            works_count=item.get("works_count") or 0,
+            cited_by_count=item.get("cited_by_count") or 0,
+        )
+        for item in payload.get("results", [])
+    ]
+
+
+def upsert_institutions(
+    conn: sqlite3.Connection, hits: list[InstitutionHit], tier: str, rank_source: str
+) -> int:
+    """Insert or update institutions, assigning rank by list order.
+
+    An adapter bound by hand is never overwritten — seeding must not undo
+    a contributor's mapping.
+    """
+    with conn:
+        for position, hit in enumerate(hits, start=1):
+            existing = conn.execute(
+                "SELECT id FROM institutions WHERE openalex_id = ?", (hit.openalex_id,)
+            ).fetchone()
+            if existing:
+                conn.execute(
+                    "UPDATE institutions SET name = ?, country = COALESCE(?, country), "
+                    "site = COALESCE(?, site), ror_id = COALESCE(?, ror_id), "
+                    "tier = ?, rank = ?, rank_source = ? WHERE id = ?",
+                    (hit.name, hit.country, hit.site, hit.ror_id, tier, position,
+                     rank_source, existing["id"]),
+                )
+                continue
+            conn.execute(
+                "INSERT INTO institutions (id, name, ror_id, openalex_id, country, site, "
+                "discovered, tier, rank, rank_source, added_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)",
+                (slugify(hit.name), hit.name, hit.ror_id, hit.openalex_id, hit.country,
+                 hit.site, tier, position, rank_source, now_iso()),
+            )
+    return len(hits)
+
+
+def import_ranking_csv(
+    conn: sqlite3.Connection, path: Path, tier: str, top: int
+) -> int:
+    """Import a QS/THE/ARWU ranking snapshot. See data/rankings/README.md for sources.
+
+    OpenAlex ids are left NULL here; `gradpath institutions resolve` fills them
+    in later, so an import never invents an identifier it cannot verify.
+    """
+    with Path(path).open() as handle:
+        reader = csv.DictReader(handle)
+        columns = {name.strip().lower() for name in (reader.fieldnames or [])}
+        if not REQUIRED_CSV_COLUMNS <= columns:
+            raise ValueError(
+                f"ranking CSV must have 'rank' and 'name' columns, found {sorted(columns)}"
+            )
+        rows = [row for row in reader][:top]
+
+    with conn:
+        for row in rows:
+            name = row["name"].strip()
+            conn.execute(
+                "INSERT INTO institutions (id, name, country, discovered, tier, rank, "
+                "rank_source, added_at) VALUES (?, ?, ?, 0, ?, ?, ?, ?) "
+                "ON CONFLICT(id) DO UPDATE SET tier = excluded.tier, "
+                "rank = excluded.rank, rank_source = excluded.rank_source",
+                (slugify(name), name, (row.get("country") or "").strip().upper() or None,
+                 tier, int(row["rank"]), f"csv:{Path(path).name}", now_iso()),
+            )
+    return len(rows)
+```
+
+Add to `gradpath/cli.py`:
+
+```python
+@institutions_app.command("top")
+def institutions_top(
+    country: str = typer.Option(..., "--country"),
+    limit: int = typer.Option(20, "--limit"),
+    metric: str = typer.Option("cited_by_count", "--metric"),
+    tier: str = typer.Option(None, "--tier"),
+) -> None:
+    """Seed the highest-output institutions in a country from OpenAlex."""
+    from gradpath.sources.institutions import top_institutions, upsert_institutions
+
+    _, _, conn, client = _context()
+    hits = top_institutions(client, country, limit, metric)
+    label = tier or f"{country.lower()}-{limit}"
+    count = upsert_institutions(conn, hits, label, f"openalex:{metric}")
+    console.print(f"[green]seeded {count}[/green] institutions as tier '{label}'")
+    for position, hit in enumerate(hits, start=1):
+        console.print(f"{position:>3}  {hit.name}")
+
+
+@institutions_app.command("import")
+def institutions_import(
+    csv_path: Path = typer.Option(..., "--csv"),
+    tier: str = typer.Option(..., "--tier"),
+    top: int = typer.Option(100, "--top"),
+) -> None:
+    """Import a QS/THE/ARWU ranking snapshot. See data/rankings/README.md."""
+    from gradpath.sources.institutions import import_ranking_csv
+
+    _, _, conn, _ = _context()
+    count = import_ranking_csv(conn, csv_path, tier, top)
+    console.print(f"[green]imported {count}[/green] institutions as tier '{tier}'")
+```
+
+Extend `discover` with a `--tier` option that resolves to OpenAlex ids and passes them as the institution filter:
+
+```python
+    tier: str = typer.Option(None, "--tier", help="restrict to a seeded tier"),
+```
+
+```python
+    institution_ids = list(institution) if institution else None
+    if tier:
+        rows = conn.execute(
+            "SELECT openalex_id FROM institutions WHERE tier = ? AND openalex_id IS NOT NULL",
+            (tier,),
+        ).fetchall()
+        if not rows:
+            console.print(
+                f"[red]tier '{tier}' has no institutions with an OpenAlex id — "
+                f"run `gradpath institutions top` first[/red]"
+            )
+            raise typer.Exit(code=1)
+        institution_ids = [row["openalex_id"] for row in rows]
+```
+
+Write `data/rankings/README.md` stating: this directory holds ranking snapshots, which are not committed because they are third-party data; the expected columns are `rank,name,country`; QS/THE/ARWU top-500 CSVs can be obtained from `https://github.com/d2ski/uni-ranks` or exported from the publishers directly; record the source and retrieval date in a sibling `.source` file so any imported rank can be cited.
+
+- [ ] **Step 4: Run tests to verify they pass**
+
+Run: `pytest tests/test_institutions.py tests/test_db.py -v`
+Expected: 8 passed in `test_institutions.py`, and `test_db.py` still passes with `SCHEMA_VERSION == 2`
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add gradpath/db.py gradpath/sources/institutions.py gradpath/cli.py \
+        data/rankings/README.md tests/test_institutions.py
+git commit -m "feat: seed institution registry from OpenAlex and ranking snapshots"
+```
+
+**Usage this unlocks:**
+
+```bash
+gradpath institutions top --country KR --limit 20 --tier korea-20
+gradpath institutions import --csv data/rankings/qs2026.csv --tier world-100 --top 100
+gradpath discover --field efficient-ml --tier korea-20
+gradpath show --min-score 0.7 --faculty-only --country KR
+```
+
 ## Self-Review
 
-**Spec coverage.** Every spec section maps to a task: architecture and repo layout (1), data model (1), configuration and profile embedding weights (2, 8), network policy (3), OpenAlex parsing and topic search (4), field-first and institution-targeted discovery with cursors (5), the mean-of-top-3 scoring rule (6), faculty likelihood including the alphabetical-field and authoritative-override rules (7), the embedding cache and vectorised scale requirement (8, plus `tests/test_scale.py`), the four-step email chain and the no-pattern-guessing rule (9, 10), adapters and the shared contract test (10, 11), budget-gated rerank and the missing-key path (12), threshold filtering with display-only `--limit` and separate score columns (13), and the CLI surface (14). Every row of the spec's error-handling table has a test except "corrupt/partial DB", which is covered structurally by transactional migrations in Task 1.
+**Spec coverage.** Every spec section maps to a task: architecture and repo layout (1), data model (1), configuration and profile embedding weights (2, 8), network policy (3), OpenAlex parsing and topic search (4), field-first and institution-targeted discovery with cursors (5), the mean-of-top-3 scoring rule (6), faculty likelihood including the alphabetical-field and authoritative-override rules (7), the embedding cache and vectorised scale requirement (8, plus `tests/test_scale.py`), the four-step email chain and the no-pattern-guessing rule (9, 10), adapters and the shared contract test (10, 11), budget-gated rerank and the missing-key path (12), threshold filtering with display-only `--limit` and separate score columns (13), the CLI surface (14), and the seeded institution registry with tiers (15). Every row of the spec's error-handling table has a test except "corrupt/partial DB", which is covered structurally by transactional migrations in Task 1.
 
 **Placeholder scan.** No TBDs, no "add error handling", no "similar to Task N". Every code step contains runnable code; the three places describing files rather than showing them in full (README, `settings.yaml`/`data/*.yaml` contents, the GIST and SNU adapters) state exactly what goes in them and, for the adapters, which four attributes differ from the KAIST body shown in full.
 
-**Type consistency.** `PoliteClient.get_json/get_text/allowed` are used with those exact names in Tasks 4, 5, 9 and 10. `ParsedWork`/`ParsedAuthorship` field names match between `parse_work` (Task 4) and `ingest.py` (Task 5). `score_person` returns `PersonScore(score, sparse, top_work_ids)` and is consumed with those attributes in Task 8. `PublicationHistory` and `FacultyAssessment` field names match between Task 7 and the CLI in Task 14. `EmailResolution(email, confidence, source, title)` matches between `resolve_email` and `persist_resolution`. `ResultRow` fields match `FIELDNAMES` in `export.py`.
+**Type consistency.** `PoliteClient.get_json/get_text/allowed` are used with those exact names in Tasks 4, 5, 9 and 10. `ParsedWork`/`ParsedAuthorship` field names match between `parse_work` (Task 4) and `ingest.py` (Task 5). `score_person` returns `PersonScore(score, sparse, top_work_ids)` and is consumed with those attributes in Task 8. `PublicationHistory` and `FacultyAssessment` field names match between Task 7 and the CLI in Task 14. `EmailResolution(email, confidence, source, title)` matches between `resolve_email` and `persist_resolution`. `ResultRow` fields match `FIELDNAMES` in `export.py`. `InstitutionHit` fields match between `top_institutions` and `upsert_institutions` in Task 15, and `SCHEMA_VERSION` is bumped to 2 in the same task that adds migration 2.
 
 **One intentional cross-task dependency**, flagged in Task 10 Step 4: the adapter contract test in `tests/test_email_chain.py` requires at least one registered adapter and therefore passes only once Task 11 lands. Running Tasks 10 and 11 in order resolves it.
