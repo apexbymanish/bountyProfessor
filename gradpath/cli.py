@@ -77,9 +77,28 @@ def _paths() -> dict[str, Path]:
 
 
 def _context() -> tuple[Settings, Profile, sqlite3.Connection, PoliteClient]:
+    """Load settings/profile/db/client for every command except `init`.
+
+    A new user's very first mistake is almost always running some other
+    command before `init`, or leaving profile.yaml half-filled-in. Both
+    load_settings and load_profile raise plain FileNotFoundError/ValueError
+    for those cases, which -- left uncaught -- surfaces as a raw Python
+    traceback: exactly the kind of failure this CLI already refuses to
+    produce for an unknown --field (see `discover`). Catch both here so
+    every command gets the same clean, actionable failure instead.
+    """
     paths = _paths()
-    settings = load_settings(paths["settings"])
-    profile = load_profile(paths["profile"])
+    try:
+        settings = load_settings(paths["settings"])
+        profile = load_profile(paths["profile"])
+    except FileNotFoundError as exc:
+        console.print(f"[red]{exc}[/red]")
+        console.print("[yellow]run `gradpath init` first to set up this workspace[/yellow]")
+        raise typer.Exit(code=1) from exc
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        console.print("[yellow]fix settings.yaml or profile.yaml and try again[/yellow]")
+        raise typer.Exit(code=1) from exc
     conn = connect(paths["db"])
     migrate(conn)
     client = PoliteClient(settings, profile.contact_email, paths["cache"])
@@ -243,11 +262,41 @@ def faculty_score() -> None:
     )
 
 
+# R36: enrich-career is one polite API call per person. `match` gives every
+# discovered person a matches row with no cap, so a threshold that defaults
+# to "everyone" (the old --min-score 0.0 default) turns a bare
+# `faculty enrich-career` into exactly the 10**4-call run R27 exists to
+# avoid. Above this many people, the command must stop and ask -- at the
+# shared 1 req/sec/host rate limit (see MAX_RATE_LIMIT in gradpath/config.py)
+# ten thousand people is roughly three hours of continuous API calls, and
+# someone who ran the command without reading --help should learn that
+# before it starts, not an hour in.
+ENRICH_CONFIRM_THRESHOLD = 200
+
+
+def _format_duration(seconds: float) -> str:
+    """A coarse, honest wall-clock estimate -- never implying more precision than it has."""
+    total = max(int(seconds), 0)
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"~{hours}h{minutes:02d}m"
+    if minutes:
+        return f"~{minutes}m{secs:02d}s"
+    return f"~{secs}s"
+
+
 @faculty_app.command("enrich-career")
 def faculty_enrich_career(
     min_score: Annotated[
-        float, typer.Option("--min-score", help="Only enrich people at or above this fit")
-    ] = 0.0,
+        float | None,
+        typer.Option(
+            "--min-score",
+            help="Only enrich people at or above this fit. Defaults to "
+                 "settings.show_min_score, so a bare run does not sweep every "
+                 "discovered person -- pass 0.0 explicitly to do that.",
+        ),
+    ] = None,
     faculty_only: Annotated[
         bool, typer.Option("--faculty-only", help="Only enrich likely faculty")
     ] = False,
@@ -256,12 +305,27 @@ def faculty_enrich_career(
 
     One polite API call per person, so this deliberately runs over a ranked,
     filtered subset -- the same --min-score/--faculty-only filtering
-    `emails resolve` uses -- never over everyone discovered. Run `match`
-    first so there is a ranking to filter by, and run this before
-    `faculty score` so its output reflects real career spans (ruling R27).
+    `emails resolve` uses -- never over everyone discovered (ruling R36).
+    Above ENRICH_CONFIRM_THRESHOLD people, this reports the count and the
+    implied wall-clock time and asks for confirmation before starting, the
+    same pattern `match --rerank` uses for spend. Run `match` first so
+    there is a ranking to filter by, and run this before `faculty score` so
+    its output reflects real career spans (ruling R27).
     """
-    _, profile, conn, client = _context()
-    targets = query_results(conn, profile.name, min_score, faculty_only)
+    settings, profile, conn, client = _context()
+    threshold = min_score if min_score is not None else settings.show_min_score
+    targets = query_results(conn, profile.name, threshold, faculty_only)
+
+    if len(targets) > ENRICH_CONFIRM_THRESHOLD:
+        eta = len(targets) / max(settings.rate_limit_per_host, 0.01)
+        proceed = typer.confirm(
+            f"{len(targets)} people match -- one polite API call each, about "
+            f"{_format_duration(eta)} at this host's rate limit. Proceed?"
+        )
+        if not proceed:
+            console.print("[yellow]aborted; nothing enriched[/yellow]")
+            return
+
     enriched = 0
     for row in targets:
         person = conn.execute(

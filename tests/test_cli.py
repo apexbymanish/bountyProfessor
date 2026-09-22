@@ -2,7 +2,7 @@ import httpx
 import respx
 from typer.testing import CliRunner
 
-from gradpath.cli import app
+from gradpath.cli import ENRICH_CONFIRM_THRESHOLD, app
 from gradpath.match.rerank import RerankOutcome, RerankPlan
 
 runner = CliRunner()
@@ -301,3 +301,160 @@ def test_match_rerank_without_api_key_leaves_stage1_usable(tmp_path, monkeypatch
     result = runner.invoke(app, ["--root", str(workspace), "match", "--rerank"], input="y\n")
     assert result.exit_code == 0
     assert "stage 1" in result.stdout.lower() or "unaffected" in result.stdout.lower()
+
+
+# --- R36: `faculty enrich-career` must actually scope, not just offer flags ---
+
+
+def _insert_person_with_match(conn, person_id, score, institution="i"):
+    conn.execute(
+        "INSERT INTO people (id, institution_id, name, openalex_author_id) VALUES (?, ?, ?, ?)",
+        (person_id, institution, f"Person {person_id}", f"A{person_id}"),
+    )
+    conn.execute(
+        "INSERT INTO matches (profile_id, person_id, stage1_score, computed_at) "
+        "VALUES ('default', ?, ?, '2026-01-01')",
+        (person_id, score),
+    )
+
+
+def test_faculty_enrich_career_default_min_score_uses_settings_show_min_score(
+    tmp_path, monkeypatch
+):
+    """A bare `faculty enrich-career` (no --min-score) must not sweep every
+    discovered person just because `match` gave everyone a matches row --
+    it should default to settings.show_min_score, same as `show`/`export`."""
+    from gradpath.db import connect, migrate
+
+    workspace = _workspace(tmp_path)
+    (workspace / "settings.yaml").write_text(SETTINGS_YAML.replace(
+        "show_min_score: 0.0", "show_min_score: 0.5"
+    ))
+    runner.invoke(app, ["--root", str(workspace), "init"])
+    conn = connect(workspace / "gradpath.db")
+    migrate(conn)
+    conn.execute("INSERT INTO institutions (id, name, added_at) VALUES ('i', 'I', '2026-01-01')")
+    with conn:
+        _insert_person_with_match(conn, 1, 0.9)   # above threshold
+        _insert_person_with_match(conn, 2, 0.1)   # below threshold
+    conn.commit()
+
+    enriched_ids: list[int] = []
+
+    def fake_enrich(conn, client, person):
+        enriched_ids.append(person["id"])
+        return True
+
+    monkeypatch.setattr("gradpath.cli.enrich_person_career", fake_enrich)
+    result = runner.invoke(app, ["--root", str(workspace), "faculty", "enrich-career"])
+    assert result.exit_code == 0
+    assert enriched_ids == [1]  # only the person at/above show_min_score
+
+
+def test_faculty_enrich_career_warns_before_a_large_run_and_can_be_declined(
+    tmp_path, monkeypatch
+):
+    """Above ENRICH_CONFIRM_THRESHOLD people, the command must report the
+    count and implied wall-clock time and ask before making any calls --
+    declining must leave nothing enriched."""
+    from gradpath.db import connect, migrate
+
+    workspace = _workspace(tmp_path)
+    runner.invoke(app, ["--root", str(workspace), "init"])
+    conn = connect(workspace / "gradpath.db")
+    migrate(conn)
+    conn.execute("INSERT INTO institutions (id, name, added_at) VALUES ('i', 'I', '2026-01-01')")
+    count = ENRICH_CONFIRM_THRESHOLD + 1
+    with conn:
+        for person_id in range(1, count + 1):
+            _insert_person_with_match(conn, person_id, 0.9)
+    conn.commit()
+
+    def unreachable_enrich(conn, client, person):
+        raise AssertionError("must not enrich anyone once the user declines")
+
+    monkeypatch.setattr("gradpath.cli.enrich_person_career", unreachable_enrich)
+    declined = runner.invoke(
+        app, ["--root", str(workspace), "faculty", "enrich-career", "--min-score", "0.0"],
+        input="n\n",
+    )
+    assert declined.exit_code == 0
+    assert str(count) in declined.stdout
+    assert "aborted" in declined.stdout.lower()
+
+
+def test_faculty_enrich_career_proceeds_past_the_threshold_on_confirmation(
+    tmp_path, monkeypatch
+):
+    from gradpath.db import connect, migrate
+
+    workspace = _workspace(tmp_path)
+    runner.invoke(app, ["--root", str(workspace), "init"])
+    conn = connect(workspace / "gradpath.db")
+    migrate(conn)
+    conn.execute("INSERT INTO institutions (id, name, added_at) VALUES ('i', 'I', '2026-01-01')")
+    count = ENRICH_CONFIRM_THRESHOLD + 1
+    with conn:
+        for person_id in range(1, count + 1):
+            _insert_person_with_match(conn, person_id, 0.9)
+    conn.commit()
+
+    monkeypatch.setattr(
+        "gradpath.cli.enrich_person_career", lambda conn, client, person: True
+    )
+    accepted = runner.invoke(
+        app, ["--root", str(workspace), "faculty", "enrich-career", "--min-score", "0.0"],
+        input="y\n",
+    )
+    assert accepted.exit_code == 0
+    assert f"enriched {count}" in accepted.stdout
+
+
+def test_faculty_enrich_career_below_threshold_never_prompts(tmp_path, monkeypatch):
+    """No confirmation should interrupt a normal, small run."""
+    from gradpath.db import connect, migrate
+
+    workspace = _workspace(tmp_path)
+    runner.invoke(app, ["--root", str(workspace), "init"])
+    conn = connect(workspace / "gradpath.db")
+    migrate(conn)
+    conn.execute("INSERT INTO institutions (id, name, added_at) VALUES ('i', 'I', '2026-01-01')")
+    with conn:
+        _insert_person_with_match(conn, 1, 0.9)
+    conn.commit()
+
+    monkeypatch.setattr(
+        "gradpath.cli.enrich_person_career", lambda conn, client, person: True
+    )
+    # No input supplied at all -- if this prompted for confirmation, Click
+    # would raise on end-of-stdin rather than returning cleanly.
+    result = runner.invoke(
+        app, ["--root", str(workspace), "faculty", "enrich-career", "--min-score", "0.0"],
+    )
+    assert result.exit_code == 0
+    assert "enriched 1" in result.stdout
+
+
+# --- first-run/misconfiguration errors must be clean, not a traceback ---
+
+
+def test_running_a_command_before_init_gives_a_clean_error(tmp_path):
+    (tmp_path / "settings.yaml").write_text(SETTINGS_YAML)
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data" / "fields.yaml").write_text(FIELDS_YAML)
+    # Deliberately no `init` call, so profile.yaml does not exist.
+    result = runner.invoke(app, ["--root", str(tmp_path), "show"])
+    assert result.exit_code != 0
+    assert result.exception is None or not isinstance(result.exception, FileNotFoundError)
+    assert "traceback" not in result.output.lower()
+    assert "init" in result.output.lower()
+
+
+def test_malformed_profile_gives_a_clean_error_not_a_traceback(tmp_path):
+    workspace = _workspace(tmp_path)
+    (workspace / "profile.yaml").write_text("name: default\ncontact_email: \"\"\n")
+    result = runner.invoke(app, ["--root", str(workspace), "show"])
+    assert result.exit_code != 0
+    assert result.exception is None or not isinstance(result.exception, ValueError)
+    assert "traceback" not in result.output.lower()
+    assert "profile.yaml" in result.output.lower()
