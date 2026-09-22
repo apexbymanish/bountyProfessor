@@ -43,6 +43,21 @@ def _short_id(url: str | None) -> str | None:
     return url.rsplit("/", 1)[-1] if url else None
 
 
+def with_mailto(client: PoliteClient, params: dict) -> dict:
+    """Merge `mailto` into `params` for OpenAlex's polite pool.
+
+    This lives here, not on PoliteClient: PoliteClient is generic (it also
+    serves Crossref, ORCID and arbitrary university sites), and attaching a
+    `mailto` to those requests would be meaningless at best and would hand
+    the operator's address to hosts that never asked for it. `setdefault`
+    keeps this idempotent rather than duplicating the key if one is somehow
+    already present.
+    """
+    merged = dict(params)
+    merged.setdefault("mailto", client.contact_email)
+    return merged
+
+
 def reconstruct_abstract(index: dict[str, list[int]] | None) -> str | None:
     """OpenAlex stores abstracts as an inverted index; rebuild the running text."""
     if not index:
@@ -90,7 +105,9 @@ def parse_work(raw: dict) -> ParsedWork:
 
 
 def search_topics(client: PoliteClient, query: str) -> list[TopicHit]:
-    payload = client.get_json(f"{OPENALEX_BASE}/topics", {"search": query, "per_page": 25})
+    payload = client.get_json(
+        f"{OPENALEX_BASE}/topics", with_mailto(client, {"search": query, "per_page": 25})
+    )
     return [
         TopicHit(
             topic_id=_short_id(item.get("id")) or "",

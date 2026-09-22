@@ -46,6 +46,7 @@ class PoliteClient:
         self._limiter = RateLimiter(settings.rate_limit_per_host)
         self._robots: dict[str, urllib.robotparser.RobotFileParser | None] = {}
         self._failures: dict[str, int] = defaultdict(int)
+        self.contact_email = contact_email
         self.user_agent = (
             f"gradpath/0.1 (+https://github.com/gradpath/gradpath; {contact_email})"
         )

@@ -1,4 +1,5 @@
 import httpx
+import pytest
 import respx
 
 from gradpath.db import connect, migrate
@@ -76,6 +77,8 @@ def test_rerunning_discover_is_idempotent(tmp_path):
     discover(conn, client, ["T10028"], ["KR"], 2021, "k")
     assert conn.execute("SELECT COUNT(*) FROM works").fetchone()[0] == 1
     assert conn.execute("SELECT COUNT(*) FROM authorships").fetchone()[0] == 1
+    assert conn.execute("SELECT COUNT(*) FROM people").fetchone()[0] == 1
+    assert conn.execute("SELECT COUNT(*) FROM institutions").fetchone()[0] == 1
 
 
 @respx.mock
@@ -155,3 +158,137 @@ def test_institution_with_missing_display_name_falls_back_to_openalex_id(tmp_pat
         "SELECT institution_id FROM people WHERE openalex_author_id = 'A1'"
     ).fetchone()
     assert person["institution_id"] == institution["id"]
+
+
+@respx.mock
+def test_query_params_include_filter_cursor_and_mailto(tmp_path):
+    """The filter/cursor/mailto parameters are the actual OpenAlex contract.
+
+    Every other test here matches respx on URL alone, so a regression in the
+    filter syntax, the cursor advancing between pages, or mailto being
+    dropped (or duplicated) could land with the suite still green. This test
+    inspects the real outgoing query parameters instead.
+    """
+    conn = connect(tmp_path / "t.db")
+    migrate(conn)
+    client = PoliteClient(SETTINGS, "me@example.com", tmp_path / "c")
+    route = respx.get("https://api.openalex.org/works").mock(side_effect=[
+        httpx.Response(200, json=_page([_work("W1", "A1")], "cur2")),
+        httpx.Response(200, json=_page([_work("W2", "A2")], None)),
+    ])
+    discover(conn, client, ["T10028"], ["KR"], 2021, "k")
+    assert route.call_count == 2
+
+    first_params = route.calls[0].request.url.params
+    assert first_params["filter"] == (
+        "publication_year:>2020,topics.id:T10028,institutions.country_code:kr"
+    )
+    assert first_params["per-page"] == "200"
+    assert first_params["cursor"] == "*"
+    assert first_params["mailto"] == "me@example.com"
+    assert first_params.get_list("mailto") == ["me@example.com"]  # exactly once
+
+    second_params = route.calls[1].request.url.params
+    assert second_params["cursor"] == "cur2"
+    assert second_params["mailto"] == "me@example.com"
+
+
+@respx.mock
+def test_institutions_filter_takes_precedence_over_countries(tmp_path):
+    conn = connect(tmp_path / "t.db")
+    migrate(conn)
+    client = PoliteClient(SETTINGS, "me@example.com", tmp_path / "c")
+    route = respx.get("https://api.openalex.org/works").mock(
+        return_value=httpx.Response(200, json=_page([], None))
+    )
+    discover(conn, client, ["T10028"], ["KR"], 2021, "k", institutions=["I1", "I2"])
+    params = route.calls[0].request.url.params
+    assert "institutions.id:I1|I2" in params["filter"]
+    assert "institutions.country_code" not in params["filter"]
+
+
+@respx.mock
+def test_page_level_refresh_survives_a_later_page_failure(monkeypatch, tmp_path):
+    """discover refreshes stats per page, not once at the end of the run.
+
+    Without that, a crash while fetching a later page (HostBlocked after
+    MAX_ATTEMPTS on an hours-long crawl is exactly this scenario) would
+    leave every already-committed person from earlier pages stuck with
+    works_count=0 and NULL years -- stale defaults Task 7 reads to decide
+    who is faculty. Simulate iter_pages raising after the first of two
+    pages and assert page 1's person already has correct, non-default
+    stats.
+    """
+    conn = connect(tmp_path / "t.db")
+    migrate(conn)
+    client = PoliteClient(SETTINGS, "me@example.com", tmp_path / "c")
+    page1 = _page([_work("W1", "A1")], "cur2")
+    calls = {"n": 0}
+
+    def fake_get_json(url, params=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return page1
+        raise RuntimeError("simulated crash mid-crawl")
+
+    monkeypatch.setattr(client, "get_json", fake_get_json)
+
+    with pytest.raises(RuntimeError):
+        discover(conn, client, ["T10028"], ["KR"], 2021, "k")
+
+    row = conn.execute(
+        "SELECT works_count, first_year, last_year FROM people WHERE openalex_author_id = 'A1'"
+    ).fetchone()
+    assert row["works_count"] == 1
+    assert row["first_year"] == 2024
+    assert row["last_year"] == 2024
+
+
+def test_interrupted_run_resumes_from_persisted_cursor_without_duplicating(monkeypatch, tmp_path):
+    """A genuine partial-resume test, not a manual cursor reset.
+
+    `test_rerunning_discover_is_idempotent` proves full re-ingest is safe by
+    manually resetting the cursor to '*'. This test proves the actually
+    load-bearing case: a run that dies mid-crawl persists its cursor past
+    page 1, and a second call to discover picks up from that persisted
+    cursor (not from '*') and produces no duplicate rows.
+    """
+    conn = connect(tmp_path / "t.db")
+    migrate(conn)
+    client = PoliteClient(SETTINGS, "me@example.com", tmp_path / "c")
+
+    page1 = _page([_work("W1", "A1")], "cur2")
+    page2 = _page([_work("W2", "A2")], None)
+    responses = iter([page1, RuntimeError("boom"), page2])
+
+    def fake_get_json(url, params=None):
+        item = next(responses)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    monkeypatch.setattr(client, "get_json", fake_get_json)
+
+    with pytest.raises(RuntimeError):
+        discover(conn, client, ["T10028"], ["KR"], 2021, "k")
+
+    # Page 1 fully committed (works + stats), and the cursor advanced past it
+    # -- it must not still read "*", or a resumed run would restart from
+    # scratch instead of resuming.
+    assert conn.execute("SELECT COUNT(*) FROM works").fetchone()[0] == 1
+    row = conn.execute(
+        "SELECT works_count FROM people WHERE openalex_author_id = 'A1'"
+    ).fetchone()
+    assert row["works_count"] == 1
+    cursor_row = conn.execute("SELECT cursor FROM cursors WHERE key = 'k'").fetchone()
+    assert cursor_row["cursor"] == "cur2"
+
+    # Resume: discover picks up from the persisted cursor and fetches only
+    # what remains (the fake client's next response is page 2).
+    discover(conn, client, ["T10028"], ["KR"], 2021, "k")
+
+    assert conn.execute("SELECT COUNT(*) FROM works").fetchone()[0] == 2
+    assert conn.execute("SELECT COUNT(*) FROM authorships").fetchone()[0] == 2
+    assert conn.execute("SELECT COUNT(*) FROM people").fetchone()[0] == 2
+    ids = [r["openalex_work_id"] for r in conn.execute("SELECT openalex_work_id FROM works")]
+    assert sorted(ids) == ["W1", "W2"]
