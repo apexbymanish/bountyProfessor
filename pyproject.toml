@@ -17,6 +17,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.2", "respx>=0.21", "ruff>=0.5"]
+rerank = ["anthropic>=1.0"]
 
 [project.scripts]
 gradpath = "gradpath.cli:app"
