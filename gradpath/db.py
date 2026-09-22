@@ -79,7 +79,28 @@ def migrate(conn: sqlite3.Connection) -> int:
     for version in sorted(MIGRATIONS):
         if version <= current:
             continue
-        with conn:
-            conn.executescript(MIGRATIONS[version])
+        try:
+            conn.execute("BEGIN")
+            _execute_migration(conn, MIGRATIONS[version])
             conn.execute("INSERT INTO schema_version (version) VALUES (?)", (version,))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
     return _current_version(conn)
+
+
+def _execute_migration(conn: sqlite3.Connection, script: str) -> None:
+    """Execute migration statements individually within a transaction.
+
+    Uses sqlite3.complete_statement() to properly parse statements,
+    ensuring string literals and complex SQL survive intact.
+    """
+    statement = ""
+    for line in script.split("\n"):
+        statement += line + "\n"
+        if sqlite3.complete_statement(statement):
+            stmt = statement.strip()
+            if stmt:
+                conn.execute(stmt)
+            statement = ""
