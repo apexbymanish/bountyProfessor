@@ -105,3 +105,35 @@ def test_embeddings_table_has_composite_primary_key_after_migration(tmp_path: Pa
         "SELECT model FROM embeddings WHERE work_id = ? ORDER BY model", (work_id,)
     ).fetchall()
     assert [row["model"] for row in rows] == ["model-a", "model-b"]
+
+
+def test_migration_3_adds_career_columns_idempotently_and_preserves_rows(
+    tmp_path: Path,
+) -> None:
+    """career_* columns hold whole-career data, separate from the slice-derived
+    works_count/first_year/last_year that discovery computes from the queried
+    topic/year window (see ruling R26)."""
+    conn = connect(tmp_path / "t.db")
+    migrate(conn)
+    conn.execute(
+        "INSERT INTO institutions (id, name, added_at) VALUES ('i', 'I', '2026-01-01')"
+    )
+    conn.execute(
+        "INSERT INTO people (id, institution_id, name, works_count, first_year, last_year) "
+        "VALUES (1, 'i', 'A Person', 5, 2023, 2024)"
+    )
+    conn.commit()
+
+    assert migrate(conn) == SCHEMA_VERSION  # second run is a no-op
+
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(people)")}
+    assert {"career_first_year", "career_last_year", "career_works_count"} <= cols
+
+    row = conn.execute("SELECT * FROM people WHERE id = 1").fetchone()
+    assert row["name"] == "A Person"
+    assert row["works_count"] == 5
+    assert row["first_year"] == 2023
+    assert row["last_year"] == 2024
+    assert row["career_first_year"] is None
+    assert row["career_last_year"] is None
+    assert row["career_works_count"] is None

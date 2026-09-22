@@ -3,7 +3,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 MIGRATIONS: dict[int, str] = {
     1: """
@@ -69,6 +69,15 @@ MIGRATIONS: dict[int, str] = {
     SELECT work_id, model, dim, vector, source, computed_at FROM embeddings;
     DROP TABLE embeddings;
     ALTER TABLE embeddings_new RENAME TO embeddings;
+    """,
+    # career_first_year/career_last_year/career_works_count hold whole-career
+    # data from the OpenAlex author object, separate from the slice-derived
+    # first_year/last_year/works_count columns which are bounded by whatever
+    # topic/--since window was queried. See ruling R26.
+    3: """
+    ALTER TABLE people ADD COLUMN career_first_year INTEGER;
+    ALTER TABLE people ADD COLUMN career_last_year INTEGER;
+    ALTER TABLE people ADD COLUMN career_works_count INTEGER;
     """,
 }
 
