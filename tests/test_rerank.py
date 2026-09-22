@@ -1,3 +1,4 @@
+import importlib.machinery
 import importlib.util
 import json
 import sys
@@ -7,8 +8,10 @@ import pytest
 
 from gradpath.db import connect, migrate
 from gradpath.match.rerank import (
+    INPUT_COST_PER_MTOK_USD,
     MissingApiKey,
     RerankRefusal,
+    RerankScore,
     _call_claude,
     plan_rerank,
     rerank,
@@ -97,11 +100,11 @@ def test_rerank_with_injected_score_fn_does_not_require_the_sdk(db, monkeypatch)
     assert importlib.util.find_spec("anthropic") is None  # sanity: truly absent
 
     def fake_score(person, works, profile_text, model):
-        return 0.4, "fine"
+        return RerankScore(0.4, "fine")
 
-    scored = rerank(db, "default", 0.7, "claude-opus-5", budget_usd=5.0,
+    result = rerank(db, "default", 0.7, "claude-opus-5", budget_usd=5.0,
                     ask=lambda _: True, score_fn=fake_score)
-    assert scored == 3
+    assert result.scored == 3
 
 
 def test_rerank_aborts_when_the_user_declines(db, monkeypatch):
@@ -110,8 +113,10 @@ def test_rerank_aborts_when_the_user_declines(db, monkeypatch):
     def unreachable_score(person, works, profile_text, model):
         raise AssertionError("score_fn must not be called when the user declines")
 
-    assert rerank(db, "default", 0.7, "claude-opus-5", 5.0, ask=lambda _: False,
-                  score_fn=unreachable_score) == 0
+    result = rerank(db, "default", 0.7, "claude-opus-5", 5.0, ask=lambda _: False,
+                    score_fn=unreachable_score)
+    assert result.scored == 0
+    assert result.spent_usd == 0.0
     assert db.execute("SELECT COUNT(*) FROM matches WHERE stage2_score IS NOT NULL")\
              .fetchone()[0] == 0
 
@@ -122,11 +127,12 @@ def test_rerank_stops_at_the_budget_ceiling(db, monkeypatch):
 
     def fake_score(person, works, profile_text, model):
         calls.append(person["id"])
-        return 0.5, "because"
+        return RerankScore(0.5, "because")
 
-    scored = rerank(db, "default", 0.0, "claude-opus-5", budget_usd=0.0,
+    result = rerank(db, "default", 0.0, "claude-opus-5", budget_usd=0.0,
                     ask=lambda _: True, score_fn=fake_score)
-    assert scored == 0
+    assert result.scored == 0
+    assert result.spent_usd == 0.0
     assert calls == []
 
 
@@ -134,16 +140,65 @@ def test_rerank_writes_score_and_reason(db, monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
 
     def fake_score(person, works, profile_text, model):
-        return 0.91, "three recent papers directly on this topic"
+        return RerankScore(0.91, "three recent papers directly on this topic")
 
-    scored = rerank(db, "default", 0.7, "claude-opus-5", budget_usd=10.0,
+    result = rerank(db, "default", 0.7, "claude-opus-5", budget_usd=10.0,
                     ask=lambda _: True, score_fn=fake_score)
-    assert scored == 3
+    assert result.scored == 3
     row = db.execute(
         "SELECT stage2_score, reason FROM matches WHERE stage2_score IS NOT NULL LIMIT 1"
     ).fetchone()
     assert row["stage2_score"] == pytest.approx(0.91)
     assert "three recent papers" in row["reason"]
+
+
+# --- R32: budget_usd is a real ceiling enforced against measured per-call
+# spend, not just a head-count predicted from the pre-flight estimate.
+
+
+def test_rerank_cumulative_spend_stops_before_exceeding_budget(db, monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    calls: list[int] = []
+
+    # Each call reports real usage costing exactly $2.00 — far more than the
+    # ~$0.013/person pre-flight estimate. If the ceiling were still just a
+    # head-count from that estimate (budget // estimate), it would allow far
+    # more than the 10 available candidates and every one of them would run.
+    # Enforcing against measured cumulative spend must stop well short.
+    real_cost_per_call = 2.0
+    input_tokens_for_that_cost = int(
+        real_cost_per_call / INPUT_COST_PER_MTOK_USD * 1_000_000
+    )
+
+    def expensive_score(person, works, profile_text, model):
+        calls.append(person["id"])
+        return RerankScore(0.5, "because",
+                           input_tokens=input_tokens_for_that_cost, output_tokens=0)
+
+    result = rerank(db, "default", 0.0, "claude-opus-5", budget_usd=5.0,
+                    ask=lambda _: True, score_fn=expensive_score)
+
+    # spent=0 -> call1 (spent=2.0) -> call2 (spent=4.0) -> call3 (spent=6.0,
+    # since 4.0 + tiny estimate <= 5.0 still passes the pre-call check) ->
+    # before call4: 6.0 + estimate > 5.0 -> stop.
+    assert len(calls) == 3
+    assert result.scored == 3
+    assert result.spent_usd == pytest.approx(6.0)
+
+
+def test_rerank_score_fn_with_no_usage_reported_runs_to_completion(db, monkeypatch):
+    # A score_fn that doesn't report usage (RerankScore's input/output token
+    # defaults) must not error and must be treated as zero-cost — injected
+    # test doubles must never be forced to fabricate token counts.
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+
+    def zero_usage_score(person, works, profile_text, model):
+        return RerankScore(0.6, "fine")  # no input_tokens/output_tokens given
+
+    result = rerank(db, "default", 0.7, "claude-opus-5", budget_usd=10.0,
+                    ask=lambda _: True, score_fn=zero_usage_score)
+    assert result.scored == 3
+    assert result.spent_usd == pytest.approx(0.0)
 
 
 # --- _call_claude: verifying the corrected content-block / structured-output /
@@ -159,10 +214,17 @@ class _FakeBlock:
         self.text = text
 
 
+class _FakeUsage:
+    def __init__(self, input_tokens=1000, output_tokens=100):
+        self.input_tokens = input_tokens
+        self.output_tokens = output_tokens
+
+
 class _FakeResponse:
-    def __init__(self, content, stop_reason="end_turn"):
+    def __init__(self, content, stop_reason="end_turn", usage=None):
         self.content = content
         self.stop_reason = stop_reason
+        self.usage = usage if usage is not None else _FakeUsage()
 
 
 class _FakeMessages:
@@ -186,6 +248,11 @@ class _FakeAnthropicClient:
 def _install_fake_anthropic(monkeypatch, response):
     fake_module = types.ModuleType("anthropic")
     fake_module.Anthropic = lambda: _FakeAnthropicClient(response)
+    # importlib.util.find_spec checks sys.modules first, and raises ValueError
+    # if the cached module has no __spec__ — give it one so rerank()'s R31
+    # SDK-presence probe correctly reports "installed" for this fake module,
+    # exactly as it would for the real package.
+    fake_module.__spec__ = importlib.machinery.ModuleSpec("anthropic", loader=None)
     monkeypatch.setitem(sys.modules, "anthropic", fake_module)
 
 
@@ -200,10 +267,24 @@ def test_call_claude_skips_leading_thinking_block_to_find_text(monkeypatch):
     _install_fake_anthropic(monkeypatch, response)
 
     person = {"name": "Dr. Example"}
-    score, reason = _call_claude(person, works=[], profile_text="ML", model="claude-opus-5")
+    result = _call_claude(person, works=[], profile_text="ML", model="claude-opus-5")
 
-    assert score == pytest.approx(0.75)
-    assert reason == "good fit"
+    assert result.score == pytest.approx(0.75)
+    assert result.reason == "good fit"
+
+
+def test_call_claude_reports_real_token_usage(monkeypatch):
+    response = _FakeResponse(
+        content=[_FakeBlock("text", text=json.dumps({"score": 0.5, "reason": "ok"}))],
+        usage=_FakeUsage(input_tokens=1234, output_tokens=56),
+    )
+    _install_fake_anthropic(monkeypatch, response)
+
+    result = _call_claude({"name": "Dr. Example"}, works=[], profile_text="ML",
+                          model="claude-opus-5")
+
+    assert result.input_tokens == 1234
+    assert result.output_tokens == 56
 
 
 def test_call_claude_uses_structured_output_config_not_prompt_and_parse(monkeypatch):
@@ -238,8 +319,34 @@ def test_rerank_skips_person_on_refusal_without_aborting_the_run(db, monkeypatch
     def flaky_score(person, works, profile_text, model):
         if person["id"] % 2 == 0:
             raise RerankRefusal("declined")
-        return 0.6, "fine"
+        return RerankScore(0.6, "fine")
 
-    scored = rerank(db, "default", 0.0, "claude-opus-5", budget_usd=100.0,
+    result = rerank(db, "default", 0.0, "claude-opus-5", budget_usd=100.0,
                     ask=lambda _: True, score_fn=flaky_score)
-    assert scored == 5  # the 5 odd-indexed people; refusals are skipped, not fatal
+    assert result.scored == 5  # the 5 odd-indexed people; refusals are skipped, not fatal
+
+
+def test_rerank_end_to_end_through_default_call_claude_with_faked_sdk(db, monkeypatch):
+    # The seam between rerank()'s loop and _call_claude's internals is
+    # otherwise untested: loop logic is covered via injected score_fn, and
+    # _call_claude's internals are covered via direct unit tests above, but
+    # nothing drives rerank() through the *default* _call_claude path. This
+    # is also where the R32 usage-reporting contract joins the two: a real
+    # RerankScore built from a faked API response's usage must flow through
+    # rerank()'s accumulation and into the written row and RerankOutcome.
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    response = _FakeResponse(
+        content=[_FakeBlock("text", text=json.dumps({"score": 0.8, "reason": "close fit"}))],
+        usage=_FakeUsage(input_tokens=1500, output_tokens=150),
+    )
+    _install_fake_anthropic(monkeypatch, response)
+
+    result = rerank(db, "default", 0.7, "claude-opus-5", budget_usd=10.0, ask=lambda _: True)
+
+    assert result.scored == 3
+    assert result.spent_usd > 0
+    row = db.execute(
+        "SELECT stage2_score, reason FROM matches WHERE stage2_score IS NOT NULL LIMIT 1"
+    ).fetchone()
+    assert row["stage2_score"] == pytest.approx(0.8)
+    assert row["reason"] == "close fit"

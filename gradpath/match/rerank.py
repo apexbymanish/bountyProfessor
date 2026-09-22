@@ -4,8 +4,11 @@ Stage 1 scores everyone locally and for free. This module adds an optional
 pass that asks Claude to re-score and explain the people already at or above
 `min_score`. It must never be required: with no `ANTHROPIC_API_KEY` set,
 `rerank` refuses cleanly and stage 1 results remain fully usable. Nothing is
-spent without the caller's confirmation (`ask`), and `budget_usd` puts a hard
-ceiling on how many people get scored.
+spent without the caller's confirmation (`ask`), and `budget_usd` is a real
+ceiling enforced against each call's *measured* token usage as the run
+proceeds — not just a head-count predicted up front from a static estimate
+(ruling R32). The pre-flight estimate in `plan_rerank` still exists, and
+still drives the confirmation prompt — that is what an estimate is for.
 """
 from __future__ import annotations
 
@@ -58,20 +61,56 @@ class RerankPlan:
     estimated_cost_usd: float
 
 
+@dataclass(frozen=True)
+class RerankScore:
+    """What a `score_fn` returns for one person.
+
+    `input_tokens`/`output_tokens` default to 0 so an injected `score_fn`
+    (as every test in this suite uses) is never forced to fabricate usage
+    it doesn't have — it's simply treated as free. `_call_claude` fills
+    these in from the real API response so `rerank` can meter actual spend.
+    """
+
+    score: float
+    reason: str
+    input_tokens: int = 0
+    output_tokens: int = 0
+
+
+@dataclass(frozen=True)
+class RerankOutcome:
+    """What one `rerank` run produced: how many people were scored, and what
+    it actually cost — metered from real per-call token usage, not the
+    pre-flight estimate — so a caller (e.g. the CLI) can report used vs.
+    predicted spend."""
+
+    scored: int
+    spent_usd: float
+
+
+def _cost_usd(input_tokens: int, output_tokens: int) -> float:
+    return (
+        input_tokens / 1_000_000 * INPUT_COST_PER_MTOK_USD
+        + output_tokens / 1_000_000 * OUTPUT_COST_PER_MTOK_USD
+    )
+
+
 def plan_rerank(
     conn: sqlite3.Connection, profile_id: str, min_score: float, model: str
 ) -> RerankPlan:
-    """Report how many people are above `min_score` and what reranking them would cost."""
+    """Report how many people are above `min_score` and what reranking them would cost.
+
+    This is a pre-flight estimate for the confirmation prompt only. The
+    actual run in `rerank` enforces `budget_usd` against measured spend, not
+    this prediction — see ruling R32.
+    """
     count = conn.execute(
         "SELECT COUNT(*) FROM matches WHERE profile_id = ? AND stage1_score >= ?",
         (profile_id, min_score),
     ).fetchone()[0]
     input_tokens = count * TOKENS_PER_PERSON_INPUT_ESTIMATE
     output_tokens = count * TOKENS_PER_PERSON_OUTPUT_ESTIMATE
-    cost = (
-        input_tokens / 1_000_000 * INPUT_COST_PER_MTOK_USD
-        + output_tokens / 1_000_000 * OUTPUT_COST_PER_MTOK_USD
-    )
+    cost = _cost_usd(input_tokens, output_tokens)
     return RerankPlan(count, input_tokens + output_tokens, round(cost, 4))
 
 
@@ -96,7 +135,7 @@ _SCORE_SCHEMA = {
 
 def _call_claude(
     person: sqlite3.Row, works: list[sqlite3.Row], profile_text: str, model: str
-) -> tuple[float, str]:
+) -> RerankScore:
     """Ask Claude to score fit. Imported lazily so the package works without the SDK."""
     try:
         from anthropic import Anthropic
@@ -127,7 +166,12 @@ def _call_claude(
 
     text_block = next(block for block in response.content if block.type == "text")
     payload = json.loads(text_block.text)
-    return float(payload["score"]), str(payload["reason"])
+    return RerankScore(
+        score=float(payload["score"]),
+        reason=str(payload["reason"]),
+        input_tokens=int(response.usage.input_tokens),
+        output_tokens=int(response.usage.output_tokens),
+    )
 
 
 def rerank(
@@ -138,16 +182,24 @@ def rerank(
     budget_usd: float,
     ask: Callable[[RerankPlan], bool],
     profile_text: str = "",
-    score_fn: Callable[..., tuple[float, str]] = _call_claude,
-) -> int:
+    score_fn: Callable[..., RerankScore] = _call_claude,
+) -> RerankOutcome:
     """Rerank everyone above `min_score`, after confirmation and within budget.
 
-    Returns the number of people actually scored. Refuses immediately (before
-    any confirmation prompt) if ANTHROPIC_API_KEY is not set, or — when using
-    the default `score_fn` — if the 'anthropic' package isn't installed.
-    Stage 1 results are unaffected either way. (Ruling R31: both checks must
-    happen before `ask` is called — a user who has already said yes to a
-    dollar figure should never then learn the tool couldn't have spent it.)
+    Returns a `RerankOutcome` with how many people were actually scored and
+    the real accumulated spend. Refuses immediately (before any confirmation
+    prompt) if ANTHROPIC_API_KEY is not set, or — when using the default
+    `score_fn` — if the 'anthropic' package isn't installed. Stage 1 results
+    are unaffected either way. (Ruling R31: both checks must happen before
+    `ask` is called — a user who has already said yes to a dollar figure
+    should never then learn the tool couldn't have spent it.)
+
+    `budget_usd` is enforced as a real ceiling against measured spend as the
+    loop runs (ruling R32), not just a head-count predicted from the
+    pre-flight estimate: before every call, if the money already spent plus
+    one more person's estimated cost would exceed `budget_usd`, the run
+    stops — checked *before* the call that would breach, since checking
+    after means the breach already happened.
     """
     if not os.environ.get("ANTHROPIC_API_KEY"):
         raise MissingApiKey(
@@ -164,12 +216,14 @@ def rerank(
 
     plan = plan_rerank(conn, profile_id, min_score, model)
     if plan.person_count == 0 or not ask(plan):
-        return 0
+        return RerankOutcome(scored=0, spent_usd=0.0)
 
-    per_person_cost = plan.estimated_cost_usd / plan.person_count
-    affordable = int(budget_usd // per_person_cost) if per_person_cost > 0 else plan.person_count
+    per_person_estimate = plan.estimated_cost_usd / plan.person_count
+    affordable = (
+        int(budget_usd // per_person_estimate) if per_person_estimate > 0 else plan.person_count
+    )
     if affordable <= 0:
-        return 0
+        return RerankOutcome(scored=0, spent_usd=0.0)
 
     rows = conn.execute(
         """
@@ -182,23 +236,31 @@ def rerank(
     ).fetchall()
 
     scored = 0
+    spent_usd = 0.0
     for row in rows:
         work_ids = json.loads(row["top_work_ids"] or "[]")[:TOP_WORKS_PER_PERSON]
         if not work_ids:
             continue
+        # R32: the real ceiling. `affordable` above only bounds the candidate
+        # pool from the pre-flight estimate; this is the check that actually
+        # protects budget_usd, against money spent so far plus one more
+        # person's estimated cost — not the fixed head-count.
+        if spent_usd + per_person_estimate > budget_usd:
+            break
         placeholders = ",".join("?" for _ in work_ids)
         works = conn.execute(
             f"SELECT title, abstract FROM works WHERE id IN ({placeholders})", work_ids
         ).fetchall()
         try:
-            score, reason = score_fn(row, works, profile_text, model)
+            result = score_fn(row, works, profile_text, model)
         except RerankRefusal:
             continue
+        spent_usd += _cost_usd(result.input_tokens, result.output_tokens)
         with conn:
             conn.execute(
                 "UPDATE matches SET stage2_score = ?, reason = ?, computed_at = ? "
                 "WHERE profile_id = ? AND person_id = ?",
-                (score, reason, now_iso(), profile_id, row["person_id"]),
+                (result.score, result.reason, now_iso(), profile_id, row["person_id"]),
             )
         scored += 1
-    return scored
+    return RerankOutcome(scored=scored, spent_usd=round(spent_usd, 6))
