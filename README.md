@@ -211,6 +211,17 @@ table) or a raw OpenAlex institution id, passed through unchanged. A slug with n
 OpenAlex id yet fails with a message telling you to run `institutions top` or
 `institutions resolve` first, rather than silently discovering nothing for it.
 
+**Limitation: an institution belongs to one tier at a time.** The schema stores a single
+`tier`/`rank` pair per institution row, not a many-to-many mapping. If the same real
+institution ends up in two tiers you've built — KAIST is both `korea-20`-seeded and present in
+a `world-100` CSV you imported, say — the second row resolves to the same OpenAlex id as the
+first. `institutions resolve` does not silently merge them (that would discard whichever
+tier/rank you imported second) or silently skip the row (indistinguishable from success); it
+reports the overlap as a conflict, names both institutions, and leaves the row unresolved for
+you to decide by hand. Supporting one institution in multiple tiers for real would need a
+many-to-many `institution_tiers` table — that's a deliberate non-goal right now, not an
+oversight. See `data/rankings/README.md` for more.
+
 ## License
 
 MIT

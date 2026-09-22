@@ -203,6 +203,7 @@ def import_ranking_csv(
 class ResolutionReport:
     resolved: list[str]
     unresolved: list[str]
+    conflicts: list[str]
 
 
 def _normalize_name(name: str) -> str:
@@ -262,6 +263,18 @@ def resolve_institutions(
     project already refuses for ROR ids and email addresses: on any
     ambiguity, leave the row unresolved and report it for a human to check.
     Only rows still missing an openalex_id are queried at all.
+
+    R38: `institutions.openalex_id` is UNIQUE, and the schema carries a
+    single tier/rank pair per institution row. A real institution that
+    appears in two tiers (e.g. KAIST seeded into "korea-20" via
+    `institutions top`, then imported again -- as a separate, siteless row
+    -- from a world-100 CSV) resolves to the *same* OpenAlex id for both
+    rows. Silently merging them would discard whichever tier/rank the user
+    imported second; silently skipping the UPDATE would look identical to
+    success. Neither is acceptable, so this is treated as a third outcome,
+    distinct from "no match": the row is left unresolved and reported as a
+    conflict naming both institutions, so the user -- who deliberately
+    built two tiers -- decides what to do about the overlap.
     """
     query = "SELECT id, name FROM institutions WHERE openalex_id IS NULL"
     params: tuple[str, ...] = ()
@@ -272,16 +285,47 @@ def resolve_institutions(
 
     resolved: list[str] = []
     unresolved: list[str] = []
+    conflicts: list[str] = []
     for row in rows:
         hit = _search_institution(client, row["name"])
         if hit is None:
             unresolved.append(row["name"])
             continue
-        with conn:
-            conn.execute(
-                "UPDATE institutions SET openalex_id = ?, ror_id = COALESCE(?, ror_id), "
-                "site = COALESCE(?, site) WHERE id = ?",
-                (hit.openalex_id, hit.ror_id, hit.site, row["id"]),
+
+        # Pre-check for a row already holding this OpenAlex id (the common
+        # case: same institution, a different tier). Caught defensively
+        # around the UPDATE too, in case of a race this pre-check missed --
+        # either way this must never raise sqlite3.IntegrityError up to the
+        # caller (ruling R38).
+        holder = conn.execute(
+            "SELECT id, name, tier FROM institutions WHERE openalex_id = ? AND id != ?",
+            (hit.openalex_id, row["id"]),
+        ).fetchone()
+        if holder is not None:
+            conflicts.append(
+                f"{row['name']!r} resolves to the same OpenAlex id as already-resolved "
+                f"{holder['name']!r} (tier {holder['tier'] or '(none)'}) -- an institution "
+                f"can only belong to one tier right now; left unresolved"
             )
+            continue
+        try:
+            with conn:
+                conn.execute(
+                    "UPDATE institutions SET openalex_id = ?, ror_id = COALESCE(?, ror_id), "
+                    "site = COALESCE(?, site) WHERE id = ?",
+                    (hit.openalex_id, hit.ror_id, hit.site, row["id"]),
+                )
+        except sqlite3.IntegrityError:
+            existing = conn.execute(
+                "SELECT name, tier FROM institutions WHERE openalex_id = ?", (hit.openalex_id,)
+            ).fetchone()
+            other_name = existing["name"] if existing else hit.openalex_id
+            other_tier = (existing["tier"] if existing else None) or "(none)"
+            conflicts.append(
+                f"{row['name']!r} resolves to the same OpenAlex id as already-resolved "
+                f"{other_name!r} (tier {other_tier}) -- an institution can only belong to "
+                f"one tier right now; left unresolved"
+            )
+            continue
         resolved.append(row["name"])
-    return ResolutionReport(resolved=resolved, unresolved=unresolved)
+    return ResolutionReport(resolved=resolved, unresolved=unresolved, conflicts=conflicts)

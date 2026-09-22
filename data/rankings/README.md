@@ -57,6 +57,21 @@ name, not whatever it matched). A near-match or a tie between candidates is
 left unresolved and printed so it can be checked by hand; `discover --tier`
 then only ever sees rows that were actually resolved.
 
+## Limitation: one tier per institution
+
+The current schema stores a single `tier`/`rank` pair per institution row —
+there is no many-to-many `institution_tiers` table. If the same real
+institution appears in two tiers you've built (e.g. KAIST is both in
+`korea-20`, seeded via `institutions top`, and in a `world-100` CSV you
+imported), the CSV row resolves to the *same* OpenAlex id as the row
+already seeded. Rather than silently merging the two (which would discard
+whichever tier/rank you imported second) or silently skipping the row
+(which would look identical to success), `institutions resolve` reports
+that as a **conflict**, naming both institutions, and leaves the CSV row
+unresolved for you to decide by hand. A real fix — letting one institution
+carry more than one tier/rank — needs that many-to-many table; it is a
+deliberate non-goal here, not an oversight.
+
 ## Recording provenance
 
 Next to each snapshot you place here, add a sibling `.source` file recording

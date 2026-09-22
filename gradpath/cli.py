@@ -613,12 +613,26 @@ def institutions_resolve(
     two candidates is left unresolved and reported here for manual checking,
     rather than silently binding one institution's rank and tier onto a
     different one.
+
+    An institution that appears in two tiers (e.g. KAIST seeded into
+    korea-20 and also imported into a world-100 CSV) resolves to the same
+    OpenAlex id for both rows -- this schema carries one tier/rank per
+    institution, so that is reported as a conflict, not silently merged or
+    silently dropped (ruling R38). Decide by hand which tier that
+    institution should keep.
     """
     from gradpath.sources.institutions import resolve_institutions
 
     _, _, conn, client = _context()
     report = resolve_institutions(conn, client, tier)
     console.print(f"[green]resolved {len(report.resolved)}[/green] institutions")
+    if report.conflicts:
+        console.print(
+            f"[red]{len(report.conflicts)} conflict(s)[/red] -- same institution resolved "
+            f"in more than one tier; left unresolved:"
+        )
+        for message in report.conflicts:
+            console.print(f"  {message}")
     if report.unresolved:
         console.print(
             f"[yellow]{len(report.unresolved)} need manual attention[/yellow] "

@@ -299,3 +299,56 @@ def test_resolve_institutions_filters_by_tier(db, client):
     report = resolve_institutions(db, client, tier="world-100")
     assert report.resolved == ["Massachusetts Institute of Technology"]
     assert route.call_count == 1  # only the world-100 row was searched
+
+
+# --- R38: an institution that resolves to the same OpenAlex id in two
+# tiers must not crash the command with an uncaught sqlite3.IntegrityError
+# (openalex_id is UNIQUE), must not silently merge the two rows (that would
+# discard whichever tier/rank was imported second -- the schema holds only
+# one tier/rank pair per institution), and must not silently skip the row
+# either (that would look identical to success). It is a distinct outcome:
+# left unresolved, reported as a conflict naming both institutions.
+
+
+@respx.mock
+def test_resolve_institutions_reports_a_cross_tier_id_collision_without_crashing(db, client):
+    # KAIST already resolved via `institutions top` into korea-20 ...
+    db.execute(
+        "INSERT INTO institutions (id, name, openalex_id, tier, rank, added_at) "
+        "VALUES ('kaist', 'KAIST', 'I1', 'korea-20', 1, '2026-01-01')"
+    )
+    # ... and the same real institution, under its full display name, also
+    # imported (no site -- CSV import never sets one) into a world-100 CSV
+    # tier, still unresolved.
+    db.execute(
+        "INSERT INTO institutions (id, name, tier, rank, added_at) "
+        "VALUES ('korea-advanced-institute-of-science-and-technology', "
+        "'Korea Advanced Institute of Science and Technology', 'world-100', 1, '2026-01-01')"
+    )
+    db.commit()
+    respx.get("https://api.openalex.org/institutions").mock(
+        return_value=httpx.Response(
+            200, json=_institutions_search_payload(
+                # OpenAlex returns the *same* id KAIST already holds.
+                [_hit("Korea Advanced Institute of Science and Technology", "I1")]
+            )
+        )
+    )
+
+    report = resolve_institutions(db, client, tier="world-100")  # must not raise
+
+    assert report.resolved == []
+    assert report.unresolved == []
+    assert len(report.conflicts) == 1
+    assert "Korea Advanced Institute of Science and Technology" in report.conflicts[0]
+    assert "KAIST" in report.conflicts[0]
+
+    row = db.execute(
+        "SELECT openalex_id, tier FROM institutions "
+        "WHERE id = 'korea-advanced-institute-of-science-and-technology'"
+    ).fetchone()
+    assert row["openalex_id"] is None  # left unresolved, not merged
+    assert row["tier"] == "world-100"  # its own tier/rank untouched
+
+    kaist = db.execute("SELECT tier FROM institutions WHERE id = 'kaist'").fetchone()
+    assert kaist["tier"] == "korea-20"  # the existing row's tier was not overwritten
