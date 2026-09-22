@@ -1,3 +1,4 @@
+import importlib.util
 import json
 import sys
 import types
@@ -57,9 +58,60 @@ def test_rerank_refuses_without_an_api_key(db, monkeypatch):
         rerank(db, "default", 0.7, "claude-opus-5", budget_usd=5.0, ask=lambda _: True)
 
 
+def test_rerank_checks_for_the_sdk_before_asking_for_confirmation(db, monkeypatch):
+    # R31: a user must never say "yes, spend $X" and only then learn the tool
+    # can't spend anything. The SDK-presence check must run — and fail —
+    # before `ask` is ever invoked, using the default score_fn (_call_claude),
+    # which is the only path that actually needs the SDK. find_spec is forced
+    # to report "not installed" here regardless of the real environment, so
+    # the test pins the ordering rather than depending on whether `anthropic`
+    # happens to be installed on the machine running it.
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    real_find_spec = importlib.util.find_spec
+
+    def fake_find_spec(name, *args, **kwargs):
+        if name == "anthropic":
+            return None
+        return real_find_spec(name, *args, **kwargs)
+
+    monkeypatch.setattr(importlib.util, "find_spec", fake_find_spec)
+
+    asked: list[object] = []
+
+    def counting_ask(plan):
+        asked.append(plan)
+        return True
+
+    with pytest.raises(MissingApiKey, match="not installed"):
+        rerank(db, "default", 0.7, "claude-opus-5", budget_usd=5.0, ask=counting_ask)
+
+    assert asked == []
+
+
+def test_rerank_with_injected_score_fn_does_not_require_the_sdk(db, monkeypatch):
+    # The SDK-presence probe must only fire on the default _call_claude path.
+    # A caller supplying their own score_fn (as every other test here does)
+    # must still be able to run with no SDK installed — that's the point of
+    # injection, and real `anthropic` genuinely isn't installed in this venv.
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    assert importlib.util.find_spec("anthropic") is None  # sanity: truly absent
+
+    def fake_score(person, works, profile_text, model):
+        return 0.4, "fine"
+
+    scored = rerank(db, "default", 0.7, "claude-opus-5", budget_usd=5.0,
+                    ask=lambda _: True, score_fn=fake_score)
+    assert scored == 3
+
+
 def test_rerank_aborts_when_the_user_declines(db, monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
-    assert rerank(db, "default", 0.7, "claude-opus-5", 5.0, ask=lambda _: False) == 0
+
+    def unreachable_score(person, works, profile_text, model):
+        raise AssertionError("score_fn must not be called when the user declines")
+
+    assert rerank(db, "default", 0.7, "claude-opus-5", 5.0, ask=lambda _: False,
+                  score_fn=unreachable_score) == 0
     assert db.execute("SELECT COUNT(*) FROM matches WHERE stage2_score IS NOT NULL")\
              .fetchone()[0] == 0
 

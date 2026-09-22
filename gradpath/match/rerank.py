@@ -9,6 +9,7 @@ ceiling on how many people get scored.
 """
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import sqlite3
@@ -31,8 +32,16 @@ TOKENS_PER_PERSON_OUTPUT_ESTIMATE = 200
 TOP_WORKS_PER_PERSON = 3
 
 
+_MISSING_SDK_MESSAGE = (
+    "The 'anthropic' package is not installed. Install it with "
+    "`pip install 'gradpath[rerank]'` to use --rerank. "
+    "Your stage 1 results are unaffected and remain fully usable."
+)
+
+
 class MissingApiKey(RuntimeError):
-    """Raised when --rerank is requested but ANTHROPIC_API_KEY is not set."""
+    """Raised when --rerank is requested but ANTHROPIC_API_KEY is not set,
+    or the 'anthropic' package isn't installed."""
 
 
 class RerankRefusal(RuntimeError):
@@ -92,11 +101,7 @@ def _call_claude(
     try:
         from anthropic import Anthropic
     except ImportError as exc:
-        raise MissingApiKey(
-            "The 'anthropic' package is not installed. Install it with "
-            "`pip install 'gradpath[rerank]'` to use --rerank. "
-            "Your stage 1 results are unaffected and remain fully usable."
-        ) from exc
+        raise MissingApiKey(_MISSING_SDK_MESSAGE) from exc
 
     evidence = "\n\n".join(
         f"- {w['title']}\n  {(w['abstract'] or '')[:800]}" for w in works
@@ -138,14 +143,24 @@ def rerank(
     """Rerank everyone above `min_score`, after confirmation and within budget.
 
     Returns the number of people actually scored. Refuses immediately (before
-    any confirmation prompt) if ANTHROPIC_API_KEY is not set — stage 1 results
-    are unaffected either way.
+    any confirmation prompt) if ANTHROPIC_API_KEY is not set, or — when using
+    the default `score_fn` — if the 'anthropic' package isn't installed.
+    Stage 1 results are unaffected either way. (Ruling R31: both checks must
+    happen before `ask` is called — a user who has already said yes to a
+    dollar figure should never then learn the tool couldn't have spent it.)
     """
     if not os.environ.get("ANTHROPIC_API_KEY"):
         raise MissingApiKey(
             "ANTHROPIC_API_KEY is not set, so --rerank cannot run. "
             "Your stage 1 results are unaffected and remain fully usable."
         )
+    # Only probe for the SDK when it will actually be used. A caller supplying
+    # their own score_fn (as every test in this suite does) must be able to
+    # run with no SDK installed at all — that's the whole point of injection.
+    # find_spec (not a trial import) answers "is it installed" without paying
+    # the import cost, preserving the laziness required alongside this check.
+    if score_fn is _call_claude and importlib.util.find_spec("anthropic") is None:
+        raise MissingApiKey(_MISSING_SDK_MESSAGE)
 
     plan = plan_rerank(conn, profile_id, min_score, model)
     if plan.person_count == 0 or not ask(plan):
