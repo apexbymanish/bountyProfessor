@@ -122,6 +122,29 @@ def test_retry_after_http_date_falls_back_to_default_backoff(client, monkeypatch
 
 
 @respx.mock
+def test_non_json_body_returns_empty_dict_instead_of_raising(client):
+    # Crossref answers an unknown DOI with a plain-text 404 body, not JSON.
+    # get_json must degrade to {} -- the same shape callers already treat as
+    # "no data" -- rather than letting json.JSONDecodeError escape.
+    respx.get("https://api.crossref.org/works/10.9999/not-a-real-doi").mock(
+        return_value=httpx.Response(404, text="Resource not found.")
+    )
+    assert client.get_json("https://api.crossref.org/works/10.9999/not-a-real-doi") == {}
+
+
+@respx.mock
+def test_non_json_body_is_not_cached(client):
+    # Caching an unparseable body would turn one transient upstream 404 into a
+    # permanent empty result for that URL until the cache is cleared by hand.
+    route = respx.get("https://api.crossref.org/works/10.9999/not-a-real-doi").mock(
+        return_value=httpx.Response(404, text="Resource not found.")
+    )
+    client.get_json("https://api.crossref.org/works/10.9999/not-a-real-doi")
+    client.get_json("https://api.crossref.org/works/10.9999/not-a-real-doi")
+    assert route.call_count == 2
+
+
+@respx.mock
 def test_circuit_breaks_host_after_repeated_failures(client, monkeypatch):
     monkeypatch.setattr("gradpath.net.http.time.sleep", lambda _seconds: None)
     route = respx.get("https://api.example.com/broken").mock(

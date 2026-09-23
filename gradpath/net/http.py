@@ -138,11 +138,24 @@ class PoliteClient:
         The file's mtime is sufficient provenance; no fetch_log write happens
         here -- that is left to database-aware callers in later tasks so this
         module never needs a database handle.
+
+        A 4xx/2xx response is returned as-is by `_request` (only 429 and 5xx
+        are retried), and some hosts -- Crossref chief among them -- answer an
+        unknown DOI with a non-JSON body on a 404. That must degrade to `{}`,
+        the same shape every caller already treats as "no data", rather than
+        letting json.JSONDecodeError (a ValueError) escape from the one
+        chokepoint every network call routes through. The unparseable body is
+        never cached: caching it would turn a transient upstream response into
+        a permanent empty result for that URL until the cache is cleared.
         """
         cached = self._cache_path(url, params)
         if cached.exists():
             return json.loads(cached.read_text())
-        payload = self._request(url, params).json()
+        response = self._request(url, params)
+        try:
+            payload = response.json()
+        except ValueError:
+            return {}
         cached.write_text(json.dumps(payload))
         return payload
 

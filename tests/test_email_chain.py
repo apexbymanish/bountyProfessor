@@ -44,6 +44,26 @@ def test_crossref_wins_and_is_marked_high(db, client):
 
 
 @respx.mock
+def test_non_json_crossref_body_falls_through_instead_of_crashing(db, client):
+    # Crossref answers an unknown/malformed DOI with a non-JSON 404 body (this
+    # is the actual, reproducible shape of the live-API crash: PoliteClient's
+    # get_json used to let json.JSONDecodeError escape uncaught). The chain
+    # must survive that and continue on to orcid, not propagate.
+    respx.get("https://api.crossref.org/works/10.1145/1234").mock(
+        return_value=httpx.Response(404, text="Resource not found.")
+    )
+    respx.get("https://pub.orcid.org/v3.0/0000-0001/record").mock(
+        return_value=httpx.Response(200, json={
+            "person": {"emails": {"email": [{"email": "park@orcid.example"}]}},
+            "activities-summary": {"employments": {"affiliation-group": []}},
+        })
+    )
+    result = resolve_email(db, client, db.execute("SELECT * FROM people").fetchone())
+    assert result.email == "park@orcid.example"
+    assert result.source == "orcid"
+
+
+@respx.mock
 def test_falls_through_to_orcid(db, client):
     respx.get("https://api.crossref.org/works/10.1145/1234").mock(
         return_value=httpx.Response(200, json={"message": {"author": []}})
