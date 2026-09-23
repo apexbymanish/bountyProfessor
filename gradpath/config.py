@@ -21,7 +21,54 @@ interests: >
 
 keywords: []
 seed_papers: []            # DOIs of papers you admire — the strongest signal
-my_papers: []
+my_papers: []              # DOIs of your own papers — weighted the same as seed_papers
+"""
+
+# `init` writes these when the file is absent, so a fresh --root is a workspace
+# every other command can run in. They are the defaults that ship in the repo;
+# an existing file is never touched, so a workspace someone has tuned survives
+# a re-run of `init` unchanged.
+SETTINGS_TEMPLATE = """\
+embedding_model: sentence-transformers/all-MiniLM-L6-v2
+embedding_batch_size: 256
+rate_limit_per_host: 1.0   # may be lowered, never raised — this tool stays polite
+default_since_year: 2021
+show_min_score: 0.65
+rerank_model: claude-opus-5
+rerank_default_budget_usd: 2.00
+cache_dir: .cache
+"""
+
+FIELDS_TEMPLATE = """\
+# Research fields, mapped to OpenAlex topic ids.
+# Run `gradpath fields search "<your area>"` to find the ids for a new one.
+efficient-ml:
+  label: Efficient machine learning
+  topics: [T10028, T11689]
+  aliases: [edge-ml, on-device-ml]
+"""
+
+INSTITUTIONS_TEMPLATE = """\
+# Curated institutions and their faculty-directory adapters. Ranks are never
+# written here -- build a tier with `gradpath institutions top` or
+# `gradpath institutions import` instead.
+kaist:
+  name: Korea Advanced Institute of Science and Technology
+  country: KR
+  site: https://www.kaist.ac.kr
+  adapter: kaist
+
+gist:
+  name: Gwangju Institute of Science and Technology
+  country: KR
+  site: https://www.gist.ac.kr
+  adapter: gist
+
+snu:
+  name: Seoul National University
+  country: KR
+  site: https://www.snu.ac.kr
+  adapter: snu
 """
 
 
@@ -84,6 +131,19 @@ def scaffold_profile(path: Path) -> None:
         raise FileExistsError(f"{path} already exists; refusing to overwrite")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(PROFILE_TEMPLATE)
+
+
+def scaffold_file(path: Path, content: str) -> bool:
+    """Write `content` to `path` only if nothing is there. Returns True if written.
+
+    Never overwrites: a workspace file the user has edited is theirs, and
+    `init` is expected to be safe to re-run.
+    """
+    if path.exists():
+        return False
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content)
+    return True
 
 
 def load_fields(path: Path) -> dict[str, FieldDef]:

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from gradpath.net.http import PoliteClient
+from gradpath.net.http import HostBlocked, PoliteClient
 
 OPENALEX_BASE = "https://api.openalex.org"
 
@@ -102,6 +102,67 @@ def parse_work(raw: dict) -> ParsedWork:
         cited_by=raw.get("cited_by_count") or 0,
         authorships=authorships,
     )
+
+
+@dataclass(frozen=True)
+class DoiResolution:
+    """What a batch of seed DOIs actually produced. Nothing is dropped silently."""
+    texts: list[str] = field(default_factory=list)
+    unresolved: list[str] = field(default_factory=list)
+    title_only: list[str] = field(default_factory=list)
+
+
+def normalise_doi(doi: str) -> str:
+    """Strip the URL forms people paste, leaving the bare `10.x/y` identifier."""
+    cleaned = doi.strip()
+    for prefix in ("https://doi.org/", "http://doi.org/", "doi:"):
+        if cleaned.lower().startswith(prefix):
+            cleaned = cleaned[len(prefix):]
+    return cleaned
+
+
+def fetch_work_by_doi(client: PoliteClient, doi: str) -> ParsedWork | None:
+    """Look one DOI up in OpenAlex. Returns None when it cannot be resolved.
+
+    Never raises: an unknown DOI is a normal outcome the caller has to report
+    to the user by name, not an error that should abort a `match` run.
+    """
+    identifier = normalise_doi(doi)
+    if not identifier:
+        return None
+    try:
+        payload = client.get_json(
+            f"{OPENALEX_BASE}/works/doi:{identifier}", with_mailto(client, {})
+        )
+    except (HostBlocked, ValueError):
+        return None
+    if not isinstance(payload, dict) or not payload.get("id"):
+        return None
+    return parse_work(payload)
+
+
+def resolve_doi_texts(client: PoliteClient, dois: list[str]) -> DoiResolution:
+    """Resolve seed DOIs to the text that describes them, keeping the misses.
+
+    An abstract describes a research area far better than a self-written
+    paragraph, which is why these are weighted double downstream. Roughly 40%
+    of OpenAlex records carry no abstract, so the title is used instead and
+    that DOI is named as title-only -- a weaker signal the user should know
+    about. A DOI that resolves to nothing is returned in `unresolved` so the
+    caller can print it: a seed paper the user believes is steering the
+    ranking, silently dropped, is precisely the failure this project refuses.
+    """
+    resolution = DoiResolution([], [], [])
+    for doi in dois:
+        work = fetch_work_by_doi(client, doi)
+        text = (work.abstract or work.title or "").strip() if work else ""
+        if not text:
+            resolution.unresolved.append(doi)
+            continue
+        if not (work and work.abstract):
+            resolution.title_only.append(doi)
+        resolution.texts.append(text)
+    return resolution
 
 
 def search_topics(client: PoliteClient, query: str) -> list[TopicHit]:

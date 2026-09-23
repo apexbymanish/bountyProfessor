@@ -156,3 +156,44 @@ def test_build_profile_vector_refuses_when_nothing_resolves():
     )
     with pytest.raises(ValueError, match="no interest inputs"):
         build_profile_vector(profile, [], FakeEmbedder())
+
+
+# --- C3: recomputing stage 1 must invalidate stage 2 ---
+
+
+def test_rerunning_run_match_clears_stale_stage2_scores_and_reasons(db):
+    """A stale stage-2 score outranks fresh stage-1 scores via COALESCE, so a
+    person whose true fit against the new interests is 0.0 was shown at 0.95
+    with a confident explanation. A stale explanation is worse than none."""
+    from gradpath.report.table import query_results
+    from gradpath.util import now_iso
+
+    vectors = {"Stale Star": [1.0, 0.0, 0.0, 0.0], "Fresh Fit": [0.0, 1.0, 0.0, 0.0]}
+    for name, vector in vectors.items():
+        work_id = _add_work(db, f"W-{name}", name, name)
+        person_id = _add_person(db, name, f"A-{name}")
+        db.execute(
+            "INSERT INTO authorships (person_id, work_id, position) VALUES (?, ?, 'last')",
+            (person_id, work_id),
+        )
+        db.execute(
+            "INSERT INTO embeddings (work_id, model, dim, vector, source, computed_at) "
+            "VALUES (?, ?, 4, ?, 'abstract', ?)",
+            (work_id, MODEL, pack(np.array(vector, dtype=np.float32)), now_iso()),
+        )
+    db.commit()
+
+    run_match(db, "default", np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32), MODEL)
+    with db:
+        db.execute(
+            "UPDATE matches SET stage2_score = 0.95, reason = 'a confident explanation' "
+            "WHERE person_id = (SELECT id FROM people WHERE name = 'Stale Star')"
+        )
+
+    # The user changes their interests; stage 1 is recomputed against them.
+    run_match(db, "default", np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float32), MODEL)
+
+    rows = db.execute("SELECT stage2_score, reason FROM matches").fetchall()
+    assert all(row["stage2_score"] is None for row in rows)
+    assert all(row["reason"] is None for row in rows)
+    assert query_results(db, "default")[0].name == "Fresh Fit"

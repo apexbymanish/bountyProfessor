@@ -11,7 +11,7 @@ publishing in that area from OpenAlex, scores each one against your interests, e
 actually faculty rather than a PhD student, resolves contact addresses from authoritative
 sources, and gives you a ranked shortlist with the evidence behind every row.
 
-> **Status: feature-complete.** The library and the `gradpath` CLI are built and tested (170+
+> **Status: feature-complete.** The library and the `gradpath` CLI are built and tested (200+
 > tests), including the seeded institution registry and tier-scoped discovery. See
 > [Current state](#current-state) for what remains genuinely unverified.
 
@@ -31,10 +31,17 @@ student" and "great match, full professor" call for completely different actions
 in separate columns. Nobody is ever filtered out by default — a heuristic that silently hides
 the right professor is the worst failure this tool could have.
 
-**Email addresses are never guessed.** The resolution chain tries Crossref, ORCID, a per-institution
-adapter, then a polite faculty-page crawler. If all four fail the answer is *no address* plus a
-homepage link — never a pattern-inferred `firstname.lastname@`. A guessed address bounces, and
-bounce rate damages every later email you send from that account.
+**Email addresses are never guessed, and never borrowed.** The resolution chain tries Crossref,
+ORCID, a per-institution adapter, then a polite faculty-page crawler. If all four fail the
+answer is *no address* plus a homepage link — never a pattern-inferred `firstname.lastname@`. A
+guessed address bounces, and bounce rate damages every later email you send from that account.
+
+The adapter step matches a directory row to a person by full name (case, accents, punctuation,
+honorifics and name order folded away), and takes an address **only from that row**. If no row
+matches, or two rows do, the answer is no address — never the next Kim on the page, and never
+whatever address happened to appear first. Which source an address came from is shown in the
+`src` column and exported as `email_source`, because a Crossref address the author published
+themselves and one scraped off a page are not equally trustworthy.
 
 **It is a good citizen.** One module makes every network call, and it enforces `robots.txt`,
 per-host rate limiting, caching, retry with backoff, and a User-Agent carrying your contact
@@ -47,6 +54,13 @@ prolific people to the mean and buries the professor with three papers precisely
 under two hundred unrelated ones. A single maximum is the opposite failure: one coincidentally
 -worded abstract promotes someone with no real overlap. Mean-of-top-3 rewards sustained overlap
 while staying robust to a lucky match. Every score records which three works produced it.
+
+**What you are matched against.** Your `interests` paragraph and `keywords` are embedded, and so
+are the abstracts of every DOI in `seed_papers` and `my_papers` — resolved through OpenAlex when
+`match` runs, and weighted double, because a real abstract describes a research area far more
+precisely than a paragraph you wrote about yourself. `match` prints how many resolved and names
+every DOI that did not, so a seed paper you believe is steering the ranking never silently
+isn't. A profile whose only signal is `seed_papers` is enough on its own.
 
 **Seniority — a faculty-likelihood estimate.** OpenAlex does not label who is faculty, and most
 authors at a university are students and postdocs. Directory confirmation and ORCID employment
@@ -73,6 +87,12 @@ supply and cite — `gradpath` intentionally ships none.
 
 Verified against live OpenAlex: a one-page discovery run returned 200 works, 1,039 researchers
 across 299 institutions, embedded and scored end to end in under two seconds.
+
+Known limitation: `people.homepage` is only ever filled in by the institution-adapter step, so
+the fourth source in the chain — the polite faculty-page crawler — is reachable only for people
+at an institution that has an adapter and whose directory row was matched unambiguously. For
+everyone else the chain effectively ends at ORCID. OpenAlex carries no homepage for an author,
+so closing that gap needs another source, not another line of code here.
 
 Known limitation: the institution adapters' directory URLs and CSS selectors are plausible but
 have **not** been verified against the live sites, and those sites change. The shared adapter
@@ -115,16 +135,26 @@ second-pass LLM scoring) requires a key, and it refuses cleanly and tells you so
 set; your stage 1 results are unaffected either way.
 
 ```bash
-# 1. Create the database, scaffold profile.yaml, and seed known institutions
-#    (with their adapters) from data/institutions.yaml. Fill in profile.yaml's
-#    contact_email and interests before continuing.
+# 1. Create a complete workspace in --root (default: the current directory):
+#    the database, settings.yaml, data/fields.yaml, data/institutions.yaml and
+#    profile.yaml, then seed the known institutions (with their adapters) from
+#    data/institutions.yaml. Existing files are never overwritten, so re-running
+#    init is safe. Fill in profile.yaml's contact_email and interests before
+#    continuing — every other command needs contact_email.
 gradpath init
 
 # 2. Not sure what OpenAlex calls your field? Search for its topic ids.
 gradpath fields search "efficient machine learning"
 
 # 3. Discover researchers publishing in a field, in the countries you care about.
+#     A run is resumable: the OpenAlex cursor is saved per query scope (topics +
+#     institutions-or-countries + since), so an interrupted crawl picks up where it
+#     stopped, and differently scoped runs never share a resume point. Once a scope
+#     has been crawled to the end it stays finished and reports that rather than
+#     silently returning 0 works; --restart clears that scope's cursor and re-crawls
+#     it, which is how you pick up newly published work.
 gradpath discover --field efficient-ml --country KR --since 2018
+gradpath discover --field efficient-ml --country KR --since 2018 --restart
 
 # 3b. Or scope discovery to a fixed institution list instead of a whole country
 #     (see "Scoping a run to a tier" below for how korea-20/--institution get set up).
@@ -132,12 +162,19 @@ gradpath discover --field efficient-ml --tier korea-20
 gradpath discover --field efficient-ml --institution kaist --institution gist
 
 # 4. Score everyone against your interests (fit). No top-N — everyone found is scored.
+#    Any seed_papers/my_papers DOIs in profile.yaml are resolved against OpenAlex
+#    here and weighted double in the profile vector; the count that resolved is
+#    printed and any DOI that did not is named, never silently dropped.
 gradpath match
 
 # 5. Fetch whole-career OpenAlex data for the top-ranked slice, so faculty
 #    scoring sees a person's real career span rather than just this query's
-#    window (see "How the scoring works" below). Runs one call per person,
-#    so it's bounded by --min-score/--faculty-only, same as emails resolve.
+#    window (see "How the scoring works" below). Runs one call per person, so
+#    it's bounded by --min-score, which defaults to settings.show_min_score; a
+#    run over more than 200 people reports its size and asks first. There is
+#    deliberately no --faculty-only here: it would filter on the very
+#    span-truncated faculty scores this step exists to correct, and at this
+#    position in the pipeline `faculty score` has not run at all yet.
 gradpath faculty enrich-career --min-score 0.6
 
 # 6. Estimate who is faculty vs. a student/postdoc. Nobody is removed —
@@ -147,7 +184,16 @@ gradpath faculty score
 
 # 7. Resolve contact addresses for people who rank, so crawling effort
 #    follows the ranking (Crossref -> ORCID -> institution adapter -> crawler).
+#    Up to ~8 network calls per person, so --min-score defaults to
+#    settings.show_min_score and a run over more than 25 people reports the
+#    count and the implied wall-clock time and asks before starting.
 gradpath emails resolve --min-score 0.7
+
+# 7b. Who still has no address, and the homepage to try by hand. An adapter
+#     that found a person's directory row but no address stores that row's
+#     homepage, so this list is a usable manual queue rather than a wall of
+#     "(no homepage)".
+gradpath emails report
 
 # 8. Look at the ranked shortlist.
 gradpath show --min-score 0.7 --faculty-only

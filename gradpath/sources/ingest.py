@@ -23,11 +23,60 @@ class DiscoverStats:
     works_seen: int = 0
     people_seen: int = 0
     institutions_added: int = 0
+    exhausted: bool = False
+
+
+def discovery_cursor_key(
+    topics: list[str],
+    countries: list[str],
+    since: int,
+    institutions: list[str] | None = None,
+) -> str:
+    """Name the cursor row for one discovery scope.
+
+    A cursor is a resume point into one specific query's result stream, so the
+    key must identify exactly the filter `iter_pages` builds -- and nothing
+    else. Two runs whose filters differ must never share a row: a finished run
+    stores a NULL cursor, which would silently turn the next, differently
+    scoped run into a no-op, and an interrupted one would have the next run
+    resume from a foreign offset and ingest an arbitrary suffix of somebody
+    else's query.
+
+    Institutions override countries here for the same reason they do in
+    `iter_pages`: when an institution list is given, the country codes are not
+    part of the query at all, so folding them into the key would fork one
+    scope into several unrelated cursors.
+    """
+    scope = (
+        "institutions=" + "|".join(sorted(institutions))
+        if institutions
+        else "countries=" + "|".join(sorted(countries))
+    )
+    return f"discover:topics={'|'.join(sorted(topics))}:{scope}:since={since}"
 
 
 def _load_cursor(conn: sqlite3.Connection, key: str) -> str | None:
     row = conn.execute("SELECT cursor FROM cursors WHERE key = ?", (key,)).fetchone()
     return row["cursor"] if row else "*"
+
+
+def cursor_is_exhausted(conn: sqlite3.Connection, key: str) -> bool:
+    """True when this scope has already been crawled to the end.
+
+    OpenAlex signals the last page by returning no next_cursor, which is
+    stored as NULL and means "done". Nothing re-opens it, so a later run over
+    the same scope fetches nothing at all -- newly published works included.
+    That is reported rather than left to look like an empty field.
+    """
+    row = conn.execute("SELECT cursor FROM cursors WHERE key = ?", (key,)).fetchone()
+    return row is not None and row["cursor"] is None
+
+
+def clear_cursor(conn: sqlite3.Connection, key: str) -> bool:
+    """Forget this scope's resume point so the next run crawls it from the start."""
+    with conn:
+        cursor = conn.execute("DELETE FROM cursors WHERE key = ?", (key,))
+    return cursor.rowcount > 0
 
 
 def _save_cursor(conn: sqlite3.Connection, key: str, cursor: str | None) -> None:
@@ -209,7 +258,7 @@ def discover(
     the page is re-fetched on retry, and those people's stats are
     recomputed then.
     """
-    stats = DiscoverStats()
+    stats = DiscoverStats(exhausted=cursor_is_exhausted(conn, cursor_key))
     touched_overall: set[int] = set()
     for page in iter_pages(client, topics, countries, since, cursor_key, conn, institutions):
         touched_page: set[int] = set()

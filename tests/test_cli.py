@@ -665,3 +665,330 @@ def test_institutions_resolve_cli_binds_an_exact_match_and_reports_unresolved(tm
     ).fetchone()
     assert resolved["openalex_id"] == "I100"
     assert unresolved["openalex_id"] is None
+
+
+# ============================================================================
+# Final review fix wave
+# ============================================================================
+
+# --- C1: the discovery cursor key must identify the actual query scope ---
+
+
+def _seed_resolved_institution(conn, slug, openalex_id, tier=None):
+    conn.execute(
+        "INSERT OR REPLACE INTO institutions (id, name, openalex_id, tier, added_at) "
+        "VALUES (?, ?, ?, ?, '2026-01-01')",
+        (slug, slug.upper(), openalex_id, tier),
+    )
+    conn.commit()
+
+
+@respx.mock
+def test_differently_scoped_discover_runs_keep_independent_cursors(tmp_path):
+    """C1: `discover --tier` then `discover --institution` must both fetch.
+
+    The README runs these two consecutively. Sharing one cursor row made the
+    second a silent no-op -- 0 works, 0 people, zero network calls -- because
+    the first run left that row's cursor NULL.
+    """
+    from gradpath.db import connect, migrate
+
+    workspace = _workspace(tmp_path)
+    runner.invoke(app, ["--root", str(workspace), "init"])
+    conn = connect(workspace / "gradpath.db")
+    migrate(conn)
+    _seed_resolved_institution(conn, "kaist", "I1", tier="korea-20")
+    _seed_resolved_institution(conn, "gist", "I2")
+
+    route = respx.get("https://api.openalex.org/works").mock(
+        return_value=_openalex_work_response()
+    )
+
+    first = runner.invoke(
+        app, ["--root", str(workspace), "discover", "--field", "efficient-ml",
+              "--tier", "korea-20"]
+    )
+    assert first.exit_code == 0, first.output
+    assert "1 works" in first.output
+
+    second = runner.invoke(
+        app, ["--root", str(workspace), "discover", "--field", "efficient-ml",
+              "--institution", "kaist", "--institution", "gist"]
+    )
+    assert second.exit_code == 0, second.output
+    assert "1 works" in second.output, "second, differently-scoped run fetched nothing"
+    assert len(route.calls) == 2, "the second scope reused the first scope's cursor"
+
+    keys = [r["key"] for r in conn.execute("SELECT key FROM cursors").fetchall()]
+    assert len(set(keys)) == 2, f"expected two independent cursor keys, got {keys}"
+
+
+@respx.mock
+def test_discover_cursor_key_ignores_countries_when_scoped_to_institutions(tmp_path):
+    """Countries are not part of an --institution query's filter, so two runs
+    that differ only by --country must share one cursor, not fork into two."""
+    from gradpath.db import connect, migrate
+
+    workspace = _workspace(tmp_path)
+    runner.invoke(app, ["--root", str(workspace), "init"])
+    conn = connect(workspace / "gradpath.db")
+    migrate(conn)
+    _seed_resolved_institution(conn, "kaist", "I1")
+
+    respx.get("https://api.openalex.org/works").mock(return_value=_openalex_work_response())
+    for country in ("KR", "JP"):
+        assert runner.invoke(
+            app, ["--root", str(workspace), "discover", "--field", "efficient-ml",
+                  "--institution", "kaist", "--country", country]
+        ).exit_code == 0
+
+    keys = [r["key"] for r in conn.execute("SELECT key FROM cursors").fetchall()]
+    assert len(keys) == 1, f"country leaked into an institution-scoped cursor key: {keys}"
+
+
+@respx.mock
+def test_exhausted_scope_is_reported_and_restart_refetches(tmp_path):
+    """C1: a completed run stores a NULL cursor meaning 'done'. Re-running must
+    say so, and --restart must clear that scope's cursor so it crawls again."""
+    workspace = _workspace(tmp_path)
+    runner.invoke(app, ["--root", str(workspace), "init"])
+    respx.get("https://api.openalex.org/works").mock(return_value=_openalex_work_response())
+
+    first = runner.invoke(app, ["--root", str(workspace), "discover", "--field", "efficient-ml"])
+    assert first.exit_code == 0
+    assert "1 works" in first.output
+
+    again = runner.invoke(app, ["--root", str(workspace), "discover", "--field", "efficient-ml"])
+    assert again.exit_code == 0
+    normalized = " ".join(again.output.lower().split())
+    assert "0 works" in normalized
+    assert "restart" in normalized, "an exhausted scope must explain why it found nothing"
+
+    restarted = runner.invoke(
+        app, ["--root", str(workspace), "discover", "--field", "efficient-ml", "--restart"]
+    )
+    assert restarted.exit_code == 0, restarted.output
+    assert "1 works" in restarted.output
+
+
+# --- I5: seed_papers / my_papers must actually reach the profile vector ---
+
+
+SEED_PROFILE_YAML = """
+name: default
+contact_email: me@example.com
+fields: [efficient-ml]
+countries: [KR]
+interests: ""
+keywords: []
+seed_papers: ["10.1145/good"]
+my_papers: ["10.1145/mine"]
+"""
+
+
+def _openalex_doi_response(title, abstract_words):
+    return httpx.Response(200, json={
+        "id": "https://openalex.org/W9", "title": title,
+        "publication_year": 2024, "doi": "https://doi.org/10.1145/good",
+        "cited_by_count": 1, "primary_location": {"source": {"display_name": "V"}},
+        "topics": [], "authorships": [],
+        "abstract_inverted_index": {word: [i] for i, word in enumerate(abstract_words)},
+    })
+
+
+@respx.mock
+def test_match_resolves_seed_papers_and_reports_them(tmp_path, monkeypatch):
+    """I5: a profile whose only signal is seed_papers must work, and the DOIs
+    must actually be resolved and fed to the profile vector."""
+    workspace = _workspace(tmp_path)
+    (workspace / "profile.yaml").write_text(SEED_PROFILE_YAML)
+    monkeypatch.setattr(
+        "gradpath.cli.load_embedder",
+        lambda name: __import__("tests.conftest", fromlist=["FakeEmbedder"]).FakeEmbedder(),
+    )
+    good = respx.get("https://api.openalex.org/works/doi:10.1145/good").mock(
+        return_value=_openalex_doi_response("Good", ["quantized", "inference"])
+    )
+    mine = respx.get("https://api.openalex.org/works/doi:10.1145/mine").mock(
+        return_value=_openalex_doi_response("Mine", ["sparse", "attention"])
+    )
+    runner.invoke(app, ["--root", str(workspace), "init"])
+    result = runner.invoke(app, ["--root", str(workspace), "match"])
+    assert result.exit_code == 0, result.output
+    assert good.called and mine.called, "seed_papers/my_papers DOIs were never resolved"
+    assert "2" in result.output
+    assert "seed" in result.output.lower()
+
+
+@respx.mock
+def test_match_names_an_unresolvable_seed_paper(tmp_path, monkeypatch):
+    """An unresolvable DOI must be visible, never silently dropped."""
+    workspace = _workspace(tmp_path)
+    (workspace / "profile.yaml").write_text(
+        SEED_PROFILE_YAML.replace('"10.1145/good"', '"10.1145/missing"')
+    )
+    monkeypatch.setattr(
+        "gradpath.cli.load_embedder",
+        lambda name: __import__("tests.conftest", fromlist=["FakeEmbedder"]).FakeEmbedder(),
+    )
+    respx.get("https://api.openalex.org/works/doi:10.1145/missing").mock(
+        return_value=httpx.Response(404, json={"error": "Not found."})
+    )
+    respx.get("https://api.openalex.org/works/doi:10.1145/mine").mock(
+        return_value=_openalex_doi_response("Mine", ["sparse", "attention"])
+    )
+    runner.invoke(app, ["--root", str(workspace), "init"])
+    result = runner.invoke(app, ["--root", str(workspace), "match"])
+    assert result.exit_code == 0, result.output
+    assert "10.1145/missing" in result.output
+
+
+@respx.mock
+def test_match_fails_cleanly_when_no_interest_input_resolves(tmp_path, monkeypatch):
+    """I5: a seed-papers-only profile whose DOIs all fail must give a clean,
+    actionable error -- not an uncaught ValueError traceback."""
+    workspace = _workspace(tmp_path)
+    (workspace / "profile.yaml").write_text(
+        SEED_PROFILE_YAML.replace('"10.1145/good"', '"10.1145/missing"')
+        .replace('"10.1145/mine"', '"10.1145/gone"')
+    )
+    monkeypatch.setattr(
+        "gradpath.cli.load_embedder",
+        lambda name: __import__("tests.conftest", fromlist=["FakeEmbedder"]).FakeEmbedder(),
+    )
+    for doi in ("missing", "gone"):
+        respx.get(f"https://api.openalex.org/works/doi:10.1145/{doi}").mock(
+            return_value=httpx.Response(404, json={"error": "Not found."})
+        )
+    runner.invoke(app, ["--root", str(workspace), "init"])
+    result = runner.invoke(app, ["--root", str(workspace), "match"])
+    assert result.exit_code == 1
+    assert result.exception is None or not isinstance(result.exception, ValueError)
+    assert "traceback" not in result.output.lower()
+
+
+# --- I6: `init` must leave a workspace where the next command works ---
+
+
+def test_init_writes_a_usable_workspace_in_an_empty_directory(tmp_path):
+    result = runner.invoke(app, ["--root", str(tmp_path), "init"])
+    assert result.exit_code == 0, result.output
+    assert (tmp_path / "settings.yaml").exists()
+    assert (tmp_path / "data" / "fields.yaml").exists()
+    assert (tmp_path / "data" / "institutions.yaml").exists()
+
+    show = runner.invoke(app, ["--root", str(tmp_path), "show"])
+    normalized = " ".join(show.output.lower().split())
+    assert "run `gradpath init` first" not in normalized
+    assert "contact_email" in normalized  # points at the one thing left to fill in
+
+    profile = (tmp_path / "profile.yaml").read_text().replace(
+        'contact_email: ""', "contact_email: me@example.com"
+    )
+    (tmp_path / "profile.yaml").write_text(profile)
+    filled = runner.invoke(app, ["--root", str(tmp_path), "show"])
+    assert filled.exit_code == 0, filled.output
+
+
+def test_init_never_overwrites_existing_workspace_files(tmp_path):
+    workspace = _workspace(tmp_path)
+    (workspace / "settings.yaml").write_text(SETTINGS_YAML + "\n# mine\n")
+    result = runner.invoke(app, ["--root", str(workspace), "init"])
+    assert result.exit_code == 0
+    assert "# mine" in (workspace / "settings.yaml").read_text()
+    assert (workspace / "data" / "fields.yaml").read_text() == FIELDS_YAML
+
+
+# --- I7: `faculty enrich-career --faculty-only` was a guaranteed no-op ---
+
+
+def test_enrich_career_no_longer_accepts_faculty_only(tmp_path):
+    """I7: the flag filtered on a column only `faculty score` populates, and
+    the documented order runs `faculty score` afterwards -- so it always
+    matched nobody while reporting success."""
+    workspace = _workspace(tmp_path)
+    runner.invoke(app, ["--root", str(workspace), "init"])
+    result = runner.invoke(
+        app, ["--root", str(workspace), "faculty", "enrich-career", "--faculty-only"]
+    )
+    assert result.exit_code != 0
+    combined = result.output + (result.stderr if result.stderr_bytes else "")
+    assert "faculty-only" in combined
+
+
+def test_enrich_career_enriches_people_with_no_faculty_confidence_yet(tmp_path, monkeypatch):
+    from gradpath.db import connect, migrate
+
+    workspace = _workspace(tmp_path)
+    runner.invoke(app, ["--root", str(workspace), "init"])
+    conn = connect(workspace / "gradpath.db")
+    migrate(conn)
+    conn.execute("INSERT INTO institutions (id, name, added_at) VALUES ('i', 'I', '2026-01-01')")
+    with conn:
+        _insert_person_with_match(conn, 1, 0.9)
+    conn.commit()
+    monkeypatch.setattr("gradpath.cli.enrich_person_career", lambda conn, client, p: True)
+    result = runner.invoke(app, ["--root", str(workspace), "faculty", "enrich-career"])
+    assert result.exit_code == 0
+    assert "enriched 1" in result.output
+
+
+# --- I8: `emails resolve` needs the same scale guard as `enrich-career` ---
+
+
+def test_emails_resolve_defaults_min_score_to_settings_show_min_score(tmp_path, monkeypatch):
+    """I8: a bare `emails resolve` must not sweep every discovered person --
+    the chain is up to 8 network calls each."""
+    from gradpath.db import connect, migrate
+
+    workspace = _workspace(tmp_path)
+    (workspace / "settings.yaml").write_text(
+        SETTINGS_YAML.replace("show_min_score: 0.0", "show_min_score: 0.5")
+    )
+    runner.invoke(app, ["--root", str(workspace), "init"])
+    conn = connect(workspace / "gradpath.db")
+    migrate(conn)
+    conn.execute("INSERT INTO institutions (id, name, added_at) VALUES ('i', 'I', '2026-01-01')")
+    with conn:
+        _insert_person_with_match(conn, 1, 0.9)
+        _insert_person_with_match(conn, 2, 0.1)
+    conn.commit()
+
+    seen: list[int] = []
+
+    def fake_resolve_email(conn, client, person_row):
+        from gradpath.sources.emails import EmailResolution
+        seen.append(person_row["id"])
+        return EmailResolution(None, "none", None)
+
+    monkeypatch.setattr("gradpath.cli.resolve_email", fake_resolve_email)
+    result = runner.invoke(app, ["--root", str(workspace), "emails", "resolve"])
+    assert result.exit_code == 0, result.output
+    assert seen == [1]
+
+
+def test_emails_resolve_warns_before_a_large_run_and_can_be_declined(tmp_path, monkeypatch):
+    from gradpath.cli import RESOLVE_CONFIRM_THRESHOLD
+    from gradpath.db import connect, migrate
+
+    workspace = _workspace(tmp_path)
+    runner.invoke(app, ["--root", str(workspace), "init"])
+    conn = connect(workspace / "gradpath.db")
+    migrate(conn)
+    conn.execute("INSERT INTO institutions (id, name, added_at) VALUES ('i', 'I', '2026-01-01')")
+    count = RESOLVE_CONFIRM_THRESHOLD + 1
+    with conn:
+        for person_id in range(1, count + 1):
+            _insert_person_with_match(conn, person_id, 0.9)
+    conn.commit()
+
+    def unreachable(conn, client, person_row):
+        raise AssertionError("must not resolve anyone once the user declines")
+
+    monkeypatch.setattr("gradpath.cli.resolve_email", unreachable)
+    declined = runner.invoke(
+        app, ["--root", str(workspace), "emails", "resolve", "--min-score", "0.0"], input="n\n"
+    )
+    assert declined.exit_code == 0
+    assert str(count) in declined.output
+    assert "aborted" in declined.output.lower()

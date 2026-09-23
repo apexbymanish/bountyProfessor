@@ -17,11 +17,15 @@ import typer
 from rich.console import Console
 
 from gradpath.config import (
+    FIELDS_TEMPLATE,
+    INSTITUTIONS_TEMPLATE,
+    SETTINGS_TEMPLATE,
     load_fields,
     load_institutions,
     load_profile,
     load_settings,
     resolve_field,
+    scaffold_file,
     scaffold_profile,
 )
 from gradpath.db import connect, migrate
@@ -39,8 +43,9 @@ from gradpath.report.export import to_csv, to_markdown
 from gradpath.report.table import query_results, render_table
 from gradpath.sources.author_stats import enrich_person_career
 from gradpath.sources.emails import persist_resolution, resolve_email
+from gradpath.sources.ingest import clear_cursor, discovery_cursor_key
 from gradpath.sources.ingest import discover as run_discover
-from gradpath.sources.openalex import search_topics
+from gradpath.sources.openalex import resolve_doi_texts, search_topics
 from gradpath.util import now_iso
 
 app = typer.Typer(help="Find the professors worth emailing for graduate study.")
@@ -130,22 +135,44 @@ def _seed_institutions(conn: sqlite3.Connection, path: Path) -> int:
 
 @app.command()
 def init() -> None:
-    """Create the database, scaffold profile.yaml, and seed known institutions."""
+    """Create a complete workspace: database, config, field/institution data, profile.
+
+    Every other command needs settings.yaml and data/fields.yaml, so writing
+    only the database and profile.yaml left a fresh --root in a loop: the next
+    command failed with "run `gradpath init` first", which the user had just
+    done. Each file is written only when absent and each one is named below,
+    so re-running `init` is safe and says exactly what it did.
+    """
     paths = _paths()
     conn = connect(paths["db"])
     version = migrate(conn)
     console.print(f"[green]database ready[/green] at {paths['db']} (schema v{version})")
+
+    for path, template in (
+        (paths["settings"], SETTINGS_TEMPLATE),
+        (paths["fields"], FIELDS_TEMPLATE),
+        (paths["institutions"], INSTITUTIONS_TEMPLATE),
+    ):
+        if scaffold_file(path, template):
+            console.print(f"[green]wrote[/green] {path}")
+        else:
+            console.print(f"{path} already exists, left untouched")
+
     try:
         scaffold_profile(paths["profile"])
         console.print(f"[green]wrote[/green] {paths['profile']} — fill in contact_email")
     except FileExistsError:
         console.print(f"profile already exists at {paths['profile']}, left untouched")
 
-    institutions_path = paths["institutions"]
-    if institutions_path.exists():
-        added = _seed_institutions(conn, institutions_path)
-        console.print(f"[green]seeded {added}[/green] known institutions from {institutions_path}")
+    added = _seed_institutions(conn, paths["institutions"])
+    console.print(
+        f"[green]seeded {added}[/green] known institutions from {paths['institutions']}"
+    )
     conn.close()
+    console.print(
+        "[yellow]next:[/yellow] fill in contact_email and interests in "
+        f"{paths['profile']}, then run `gradpath discover`"
+    )
 
 
 @fields_app.command("search")
@@ -218,6 +245,14 @@ def discover(
     since: Annotated[
         int | None, typer.Option("--since", help="Earliest publication year")
     ] = None,
+    restart: Annotated[
+        bool,
+        typer.Option(
+            "--restart",
+            help="Forget this scope's saved cursor and crawl it from the start, "
+                 "picking up works published since it last finished",
+        ),
+    ] = False,
 ) -> None:
     """Find researchers. Field-first by default; --institution/--tier target a fixed list."""
     settings, profile, conn, client = _context()
@@ -247,7 +282,10 @@ def discover(
             raise typer.Exit(code=1)
         institution_ids = [row["openalex_id"] for row in rows]
 
-    key = f"discover:{'|'.join(sorted(topics))}:{'|'.join(sorted(countries))}:{since_year}"
+    key = discovery_cursor_key(topics, countries, since_year, institution_ids)
+    if restart and clear_cursor(conn, key):
+        console.print("[yellow]cleared this scope's cursor — crawling it from the start[/yellow]")
+
     stats = run_discover(
         conn, client, topics, countries, since_year, key,
         institution_ids,
@@ -257,6 +295,15 @@ def discover(
         f"[green]{stats.people_seen}[/green] people, "
         f"[green]{stats.institutions_added}[/green] new institutions"
     )
+    if stats.exhausted:
+        # A finished crawl stores a NULL cursor meaning "done", so this scope
+        # will fetch nothing until it is reset. Saying so is the difference
+        # between "there is nothing new" (false) and "I did not look" (true).
+        console.print(
+            "[yellow]this scope was already crawled to the end, so nothing was "
+            "fetched — run it again with --restart to re-crawl it and pick up "
+            "newly published works[/yellow]"
+        )
 
 
 @faculty_app.command("score")
@@ -329,6 +376,14 @@ def faculty_score() -> None:
 # before it starts, not an hour in.
 ENRICH_CONFIRM_THRESHOLD = 200
 
+# The email chain is up to 5 Crossref lookups + 1 ORCID + the institution
+# adapter's directory pages + 1 crawl per person -- an order of magnitude more
+# traffic per person than enrich-career's single call. The confirmation
+# threshold is scaled down to match, so both commands ask at roughly the same
+# amount of outbound traffic rather than at the same number of people.
+RESOLVE_CALLS_PER_PERSON = 8
+RESOLVE_CONFIRM_THRESHOLD = 25
+
 
 def _format_duration(seconds: float) -> str:
     """A coarse, honest wall-clock estimate -- never implying more precision than it has."""
@@ -342,6 +397,38 @@ def _format_duration(seconds: float) -> str:
     return f"~{secs}s"
 
 
+def _confirm_scale(
+    people: int,
+    calls_per_person: int,
+    threshold: int,
+    settings: Settings,
+    abort_note: str,
+) -> bool:
+    """Report the size of a large network run and ask before starting it.
+
+    Returns True to proceed. Below `threshold` nothing is printed and nothing
+    is asked, so a normal small run is never interrupted. Someone who ran the
+    command without reading --help should learn that it is an hours-long crawl
+    before it starts, not an hour in.
+    """
+    if people <= threshold:
+        return True
+    calls = people * calls_per_person
+    eta = calls / max(settings.rate_limit_per_host, 0.01)
+    detail = (
+        "one polite API call each"
+        if calls_per_person == 1
+        else f"up to {calls_per_person} polite network calls each ({calls} in total)"
+    )
+    if typer.confirm(
+        f"{people} people match -- {detail}, about {_format_duration(eta)} "
+        f"at this host's rate limit. Proceed?"
+    ):
+        return True
+    console.print(f"[yellow]aborted; {abort_note}[/yellow]")
+    return False
+
+
 @faculty_app.command("enrich-career")
 def faculty_enrich_career(
     min_score: Annotated[
@@ -353,34 +440,32 @@ def faculty_enrich_career(
                  "discovered person -- pass 0.0 explicitly to do that.",
         ),
     ] = None,
-    faculty_only: Annotated[
-        bool, typer.Option("--faculty-only", help="Only enrich likely faculty")
-    ] = False,
 ) -> None:
     """Fetch each person's whole-career OpenAlex record (span, volume).
 
-    One polite API call per person, so this deliberately runs over a ranked,
-    filtered subset -- the same --min-score/--faculty-only filtering
-    `emails resolve` uses -- never over everyone discovered (ruling R36).
-    Above ENRICH_CONFIRM_THRESHOLD people, this reports the count and the
-    implied wall-clock time and asks for confirmation before starting, the
-    same pattern `match --rerank` uses for spend. Run `match` first so
+    One polite API call per person, so this deliberately runs over a ranked
+    subset filtered by --min-score, never over everyone discovered (ruling
+    R36). Above ENRICH_CONFIRM_THRESHOLD people, this reports the count and
+    the implied wall-clock time and asks for confirmation before starting,
+    the same pattern `match --rerank` uses for spend. Run `match` first so
     there is a ranking to filter by, and run this before `faculty score` so
     its output reflects real career spans (ruling R27).
+
+    There is deliberately no --faculty-only here. It would filter on
+    faculty_confidence, which only `faculty score` writes -- so at the
+    documented position (before `faculty score`) it matched nobody and
+    reported success, and at any other position it would filter on exactly
+    the un-enriched, span-truncated scores this command exists to correct,
+    hiding the long-career professors it should reach most.
     """
     settings, profile, conn, client = _context()
     threshold = min_score if min_score is not None else settings.show_min_score
-    targets = query_results(conn, profile.name, threshold, faculty_only)
+    targets = query_results(conn, profile.name, threshold)
 
-    if len(targets) > ENRICH_CONFIRM_THRESHOLD:
-        eta = len(targets) / max(settings.rate_limit_per_host, 0.01)
-        proceed = typer.confirm(
-            f"{len(targets)} people match -- one polite API call each, about "
-            f"{_format_duration(eta)} at this host's rate limit. Proceed?"
-        )
-        if not proceed:
-            console.print("[yellow]aborted; nothing enriched[/yellow]")
-            return
+    if not _confirm_scale(
+        len(targets), 1, ENRICH_CONFIRM_THRESHOLD, settings, "nothing enriched"
+    ):
+        return
 
     enriched = 0
     for row in targets:
@@ -397,7 +482,15 @@ def faculty_enrich_career(
 
 @emails_app.command("resolve")
 def emails_resolve(
-    min_score: Annotated[float, typer.Option("--min-score")] = 0.0,
+    min_score: Annotated[
+        float | None,
+        typer.Option(
+            "--min-score",
+            help="Only resolve people at or above this fit. Defaults to "
+                 "settings.show_min_score, so a bare run does not sweep every "
+                 "discovered person -- pass 0.0 explicitly to do that.",
+        ),
+    ] = None,
     faculty_only: Annotated[bool, typer.Option("--faculty-only")] = False,
 ) -> None:
     """Resolve addresses for people who rank, so crawling effort follows the ranking.
@@ -405,9 +498,23 @@ def emails_resolve(
     Targets are looked up by person_id, not display name: at 10**4
     researchers, name collisions are near-certain, and a name-keyed lookup
     would resolve (and overwrite) the wrong person's address.
+
+    The chain is up to RESOLVE_CALLS_PER_PERSON network calls per person, so
+    --min-score defaults to settings.show_min_score and a run over more than
+    RESOLVE_CONFIRM_THRESHOLD people reports its size and asks first -- the
+    same guard `faculty enrich-career` has, for a command that generates an
+    order of magnitude more traffic.
     """
-    _, profile, conn, client = _context()
-    targets = query_results(conn, profile.name, min_score, faculty_only)
+    settings, profile, conn, client = _context()
+    threshold = min_score if min_score is not None else settings.show_min_score
+    targets = query_results(conn, profile.name, threshold, faculty_only)
+
+    if not _confirm_scale(
+        len(targets), RESOLVE_CALLS_PER_PERSON, RESOLVE_CONFIRM_THRESHOLD,
+        settings, "no addresses resolved",
+    ):
+        return
+
     resolved = 0
     for row in targets:
         person = conn.execute(
@@ -433,6 +540,36 @@ def emails_report() -> None:
     console.print(f"[yellow]{len(rows)} addresses need manual lookup[/yellow]")
 
 
+def _resolve_seed_papers(client: PoliteClient, profile: Profile) -> list[str]:
+    """Resolve seed_papers/my_papers DOIs to abstracts, reporting what happened.
+
+    Both the README and PROFILE_TEMPLATE call seed_papers "the strongest
+    signal", and they weigh double in `build_profile_vector` -- so a user who
+    supplies DOIs must be able to see that they were used. Every DOI that did
+    not resolve is named: believing you steered the ranking when you did not
+    is exactly the confidently-wrong outcome this project refuses.
+    """
+    dois = list(profile.seed_papers) + list(profile.my_papers)
+    if not dois:
+        return []
+    resolution = resolve_doi_texts(client, dois)
+    console.print(
+        f"[green]resolved {len(resolution.texts)}[/green] of {len(dois)} seed papers "
+        f"(seed_papers + my_papers), weighted double in the profile vector"
+    )
+    if resolution.title_only:
+        console.print(
+            f"[yellow]{len(resolution.title_only)} had no abstract in OpenAlex[/yellow]; "
+            f"title used instead: {', '.join(resolution.title_only)}"
+        )
+    if resolution.unresolved:
+        console.print(
+            f"[red]{len(resolution.unresolved)} could not be resolved[/red] and did not "
+            f"influence the ranking: {', '.join(resolution.unresolved)}"
+        )
+    return resolution.texts
+
+
 @app.command("match")
 def match_command(
     do_rerank: Annotated[
@@ -452,13 +589,22 @@ def match_command(
     ] = None,
 ) -> None:
     """Score every person. No cap."""
-    settings, profile, conn, _ = _context()
+    settings, profile, conn, client = _context()
     embedder = load_embedder(settings.embedding_model)
     added = embed_pending_works(
         conn, embedder, settings.embedding_model, settings.embedding_batch_size
     )
     console.print(f"embedded {added} new works")
-    vector = build_profile_vector(profile, [], embedder)
+
+    seed_abstracts = _resolve_seed_papers(client, profile)
+    try:
+        vector = build_profile_vector(profile, seed_abstracts, embedder)
+    except ValueError as exc:
+        # A seed-papers-only profile whose DOIs all failed to resolve lands
+        # here. Left uncaught this was a traceback telling the user to fill in
+        # a field they had already filled in.
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
     scored = run_match(conn, profile.name, vector, settings.embedding_model)
     console.print(f"[green]scored {scored} people[/green]")
 

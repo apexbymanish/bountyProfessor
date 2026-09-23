@@ -7,7 +7,8 @@ from rich.table import Table
 
 FIELDNAMES = [
     "person_id", "rank", "name", "institution", "country", "fit", "faculty_score",
-    "faculty_confidence", "email", "email_confidence", "sparse", "reason",
+    "faculty_confidence", "email", "email_confidence", "email_source", "sparse",
+    "reason",
 ]
 
 
@@ -23,6 +24,7 @@ class ResultRow:
     faculty_confidence: str | None
     email: str | None
     email_confidence: str | None
+    email_source: str | None
     sparse: bool
     reason: str | None
 
@@ -51,7 +53,7 @@ def query_results(
         SELECT m.person_id, p.name, i.name AS institution, i.country,
                COALESCE(m.stage2_score, m.stage1_score) AS fit,
                p.faculty_score, p.faculty_confidence,
-               p.email, p.email_confidence, m.sparse, m.reason
+               p.email, p.email_confidence, p.email_source, m.sparse, m.reason
         FROM matches m
         JOIN people p ON p.id = m.person_id
         LEFT JOIN institutions i ON i.id = p.institution_id
@@ -74,6 +76,7 @@ def query_results(
             faculty_confidence=row["faculty_confidence"],
             email=row["email"],
             email_confidence=row["email_confidence"],
+            email_source=row["email_source"],
             sparse=bool(row["sparse"]),
             reason=row["reason"],
         )
@@ -82,9 +85,15 @@ def query_results(
 
 
 def render_table(rows: list[ResultRow]) -> Table:
-    """Fit and faculty stay in separate columns — they are never blended."""
+    """Fit and faculty stay in separate columns — they are never blended.
+
+    `src` is where the address came from — crossref, orcid, adapter or
+    crawler. Those differ enormously in trustworthiness (a Crossref address
+    the author themselves published, versus one scraped off a page), and an
+    address with no visible provenance invites equal trust in all of them.
+    """
     table = Table(title="gradpath results")
-    for header in ("#", "name", "institution", "cc", "fit", "faculty", "email"):
+    for header in ("#", "name", "institution", "cc", "fit", "faculty", "email", "src"):
         table.add_column(header)
     for row in rows:
         marker = " *sparse" if row.sparse else ""
@@ -96,5 +105,6 @@ def render_table(rows: list[ResultRow]) -> Table:
             f"{row.fit:.3f}",
             f"{row.faculty_confidence or '-'}",
             row.email or "(not found)",
+            row.email_source or "-",
         )
     return table

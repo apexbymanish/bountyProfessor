@@ -101,8 +101,9 @@ def build_profile_vector(
             weights.append(SEED_PAPER_WEIGHT)
     if not texts:
         raise ValueError(
-            "no interest inputs resolved — fill in interests, keywords or seed_papers "
-            "in profile.yaml before running match"
+            "no interest inputs resolved — interests and keywords are empty and no "
+            "seed_papers/my_papers DOI resolved to any text. Fill in interests or "
+            "keywords in profile.yaml, or check the DOIs reported above."
         )
     matrix = np.asarray(embedder.encode(texts), dtype=np.float32)
     weight_vector = np.asarray(weights, dtype=np.float32).reshape(-1, 1)
@@ -147,7 +148,15 @@ def run_match(
                     stage1_score = excluded.stage1_score,
                     top_work_ids = excluded.top_work_ids,
                     sparse = excluded.sparse,
-                    computed_at = excluded.computed_at
+                    computed_at = excluded.computed_at,
+                    -- Recomputing stage 1 invalidates stage 2. `query_results`
+                    -- ranks on COALESCE(stage2, stage1), so a stale stage-2
+                    -- score keeps outranking every fresh stage-1 one, and its
+                    -- `reason` sentence explains a fit that no longer exists.
+                    -- A missing explanation is recoverable; a confident wrong
+                    -- one is not. Rerun `match --rerank` to recompute stage 2.
+                    stage2_score = NULL,
+                    reason = NULL
                 """,
                 (profile_id, person_id, result.score, json.dumps(result.top_work_ids),
                  int(result.sparse), stamp),

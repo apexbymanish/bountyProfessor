@@ -1,14 +1,24 @@
 from __future__ import annotations
 
+import re
 import sqlite3
+import unicodedata
 from dataclasses import dataclass
 
+from gradpath.models import FacultyRecord
 from gradpath.net.http import HostBlocked, PoliteClient
 from gradpath.sources.adapters import get_adapter
-from gradpath.sources.crawler import crawl_faculty_email, extract_emails
+from gradpath.sources.crawler import crawl_faculty_email
 from gradpath.sources.crossref import crossref_email
 from gradpath.sources.orcid import orcid_record
 from gradpath.util import now_iso
+
+# Directory pages routinely prefix a rank or honorific onto the displayed name.
+# These carry no identity, so they are dropped before comparing.
+HONORIFICS = frozenset({
+    "prof", "professor", "dr", "phd", "mr", "mrs", "ms", "miss",
+    "assoc", "associate", "asst", "assistant", "emeritus", "adjunct",
+})
 
 
 @dataclass(frozen=True)
@@ -17,6 +27,26 @@ class EmailResolution:
     confidence: str          # high | medium | none
     source: str | None       # crossref | orcid | adapter | crawler | None
     title: str | None = None
+    homepage: str | None = None
+
+
+def normalise_name(name: str) -> frozenset[str]:
+    """Reduce a display name to a comparable set of tokens.
+
+    Accents, case, punctuation and honorifics are folded away, and the result
+    is a *set* so "Sunmi Park" and "Park Sunmi" compare equal -- Korean and
+    Japanese directories invert order freely, and OpenAlex does not.
+    Single-token names return an empty set: one token is not enough to
+    identify a person, and treating it as a match is exactly the bug that
+    attached a stranger's address to a row at confidence 'high'.
+    """
+    folded = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode()
+    tokens = {
+        token
+        for token in re.split(r"[^a-z0-9]+", folded.lower())
+        if token and token not in HONORIFICS
+    }
+    return frozenset(tokens) if len(tokens) >= 2 else frozenset()
 
 
 def _recent_dois(conn: sqlite3.Connection, person_id: int, limit: int = 5) -> list[str]:
@@ -31,19 +61,37 @@ def _recent_dois(conn: sqlite3.Connection, person_id: int, limit: int = 5) -> li
     return [row["doi"] for row in rows]
 
 
-def _adapter_email(
+def match_directory_record(
+    name: str, records: list[FacultyRecord]
+) -> FacultyRecord | None:
+    """Return the one record that is unambiguously this person, else None.
+
+    Equality of normalised full names, never a substring of one token: the
+    old `surname in record.name.lower()` matched every Kim on the page and
+    handed back whichever was listed first. Two matching records means two
+    people share a name on that directory, and picking either one is a coin
+    toss -- so that is a miss, not a match.
+    """
+    target = normalise_name(name)
+    if not target:
+        return None
+    matches = [record for record in records if normalise_name(record.name) == target]
+    return matches[0] if len(matches) == 1 else None
+
+
+def adapter_record(
     conn: sqlite3.Connection, client: PoliteClient, person_row: sqlite3.Row
-) -> tuple[str | None, str | None]:
+) -> FacultyRecord | None:
+    """Find this person's own row in their institution's faculty directory."""
     institution = conn.execute(
         "SELECT adapter FROM institutions WHERE id = ?", (person_row["institution_id"],)
     ).fetchone()
     if not institution or not institution["adapter"]:
-        return None, None
+        return None
     adapter_cls = get_adapter(institution["adapter"])
     if adapter_cls is None:
-        return None, None
+        return None
     adapter = adapter_cls()
-    surname = person_row["name"].split()[-1].lower()
     for url in adapter.faculty_urls():
         try:
             html = client.get_text(url)
@@ -51,13 +99,10 @@ def _adapter_email(
             continue
         if html is None:
             continue
-        for record in adapter.parse_faculty(html, url):
-            if surname in record.name.lower():
-                email = record.email or (
-                    extract_emails(html)[0] if extract_emails(html) else None
-                )
-                return email, record.title
-    return None, None
+        record = match_directory_record(person_row["name"], adapter.parse_faculty(html, url))
+        if record is not None:
+            return record
+    return None
 
 
 def resolve_email(
@@ -65,41 +110,61 @@ def resolve_email(
 ) -> EmailResolution:
     """Try each source in order, stopping at the first hit.
 
-    An address is never inferred from a name pattern. A guessed address bounces,
-    and bounce rate is a deliverability signal that damages every later email
-    sent from the same account — a NULL plus a homepage link is more useful.
+    An address is never inferred from a name pattern, and never harvested
+    from somewhere other than the matched record. A guessed or borrowed
+    address bounces, and bounce rate is a deliverability signal that damages
+    every later email sent from the same account -- and a *misattributed*
+    address labelled 'high' confidence is worse still, because nothing
+    downstream can tell it apart from a real one. A NULL plus a homepage
+    link is more useful than either.
     """
     for doi in _recent_dois(conn, person_row["id"]):
         email = crossref_email(client, doi, person_row["name"])
         if email:
-            return EmailResolution(email, "high", "crossref")
+            return EmailResolution(email, "high", "crossref", homepage=person_row["homepage"])
 
     title = None
+    homepage = person_row["homepage"]
     if person_row["orcid"]:
         record = orcid_record(client, person_row["orcid"])
         if record:
             title = record.title
             if record.email:
-                return EmailResolution(record.email, "high", "orcid", title)
+                return EmailResolution(record.email, "high", "orcid", title, homepage)
 
-    email, adapter_title = _adapter_email(conn, client, person_row)
+    directory = adapter_record(conn, client, person_row)
+    if directory is not None:
+        # Only an unambiguously matched record's metadata is trusted: its
+        # title feeds `_has_professor_title`, which short-circuits faculty
+        # scoring to 1.0/high, so a borrowed title is a confidently wrong
+        # seniority estimate as well as a wrong address.
+        title = directory.title or title
+        homepage = homepage or directory.homepage
+        if directory.email:
+            return EmailResolution(directory.email, "high", "adapter", title, homepage)
+
+    email = crawl_faculty_email(client, homepage, person_row["name"])
     if email:
-        return EmailResolution(email, "high", "adapter", adapter_title or title)
+        return EmailResolution(email, "medium", "crawler", title, homepage)
 
-    email = crawl_faculty_email(client, person_row["homepage"], person_row["name"])
-    if email:
-        return EmailResolution(email, "medium", "crawler", title)
-
-    return EmailResolution(None, "none", None, title)
+    return EmailResolution(None, "none", None, title, homepage)
 
 
 def persist_resolution(
     conn: sqlite3.Connection, person_id: int, resolution: EmailResolution
 ) -> None:
+    """Write a resolution back, including the homepage it discovered.
+
+    homepage is COALESCEd on both sides: a newly discovered one fills a NULL
+    column (making the crawler stage reachable on a later run, and `emails
+    report` useful), and a resolution that found none never erases one that
+    is already stored.
+    """
     with conn:
         conn.execute(
             "UPDATE people SET email = ?, email_confidence = ?, email_source = ?, "
-            "title = COALESCE(?, title), last_seen_at = ? WHERE id = ?",
+            "title = COALESCE(?, title), homepage = COALESCE(homepage, ?), "
+            "last_seen_at = ? WHERE id = ?",
             (resolution.email, resolution.confidence, resolution.source,
-             resolution.title, now_iso(), person_id),
+             resolution.title, resolution.homepage, now_iso(), person_id),
         )

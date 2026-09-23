@@ -107,3 +107,24 @@ def test_person_id_is_populated_and_survives_export(db, tmp_path):
     assert csv_rows[0]["person_id"] == "3", "CSV person_id for Prof DE should be 3"
     assert csv_rows[1]["person_id"] == "2", "CSV person_id for Maybe Student should be 2"
     assert csv_rows[2]["person_id"] == "1", "CSV person_id for Prof High should be 1"
+
+
+# --- email_source must be visible: crossref/orcid/adapter/crawl differ hugely ---
+
+
+def test_email_source_is_exported_and_rendered(db, tmp_path):
+    db.execute("UPDATE people SET email_source = 'adapter' WHERE id = 1")
+    db.commit()
+    rows = query_results(db, "default")
+    by_name = {row.name: row for row in rows}
+    assert by_name["Prof High"].email_source == "adapter"
+
+    path = tmp_path / "out.csv"
+    to_csv(rows, path)
+    exported = list(csv.DictReader(path.open()))
+    assert "email_source" in exported[0]
+    prof_high = next(r for r in exported if r["name"] == "Prof High")
+    assert prof_high["email_source"] == "adapter"
+
+    table = render_table(rows)
+    assert any("src" in c.header or "source" in c.header for c in table.columns)
