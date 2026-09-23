@@ -327,3 +327,182 @@ def test_persist_resolution_never_clears_an_existing_homepage(db, client, monkey
     persist_resolution(db, person["id"], EmailResolution(None, "none", None))
     stored = db.execute("SELECT homepage FROM people WHERE id = ?", (person["id"],)).fetchone()
     assert stored["homepage"] == "https://lab.example.com/park"
+
+
+# ============================================================================
+# C2 residual 1: the unambiguity guard must span the whole directory, not one
+# page of it. Every shipped adapter exposes two departmental pages, so a
+# per-page check can never see the second Jaewon Kim in the other department.
+# ============================================================================
+
+PAGE_CS = "https://dir.example.com/cs/faculty"
+PAGE_EE = "https://dir.example.com/ee/faculty"
+
+
+def _use_paged_directory(monkeypatch, pages, client=None, blocked=()):
+    """Register a fake adapter whose directory spans several pages.
+
+    `pages` maps a URL to the records parsed from it; `blocked` lists URLs the
+    adapter advertises but the client cannot read (HostBlocked), which needs
+    `client` so its get_text can be made to raise for exactly those URLs.
+    """
+    from typing import ClassVar
+
+    from gradpath.sources.adapters import _REGISTRY
+    from gradpath.sources.adapters.base import InstitutionAdapter
+
+    urls = list(pages) + list(blocked)
+
+    class _PagedAdapter(InstitutionAdapter):
+        slug = "test-directory"
+        domains: ClassVar[list[str]] = ["dir.example.com"]
+
+        def faculty_urls(self):
+            return urls
+
+        def parse_faculty(self, page_html, url):
+            return list(pages.get(url, ()))
+
+    monkeypatch.setitem(_REGISTRY, _PagedAdapter.slug, _PagedAdapter)
+    respx.get("https://dir.example.com/robots.txt").mock(
+        return_value=httpx.Response(200, text="User-agent: *\nAllow: /\n")
+    )
+    for url in pages:
+        respx.get(url).mock(return_value=httpx.Response(200, text="<html></html>"))
+
+    if blocked:
+        original = client.get_text
+
+        def _get_text(url):
+            if url in blocked:
+                raise HostBlocked(url)
+            return original(url)
+
+        monkeypatch.setattr(client, "get_text", _get_text)
+
+
+@respx.mock
+def test_same_name_on_two_directory_pages_is_ambiguous(db, client, monkeypatch):
+    """C2 residual 1: two departments, one name, and the first page read wins.
+
+    The per-page check returned jaewon.cs@ at confidence 'high' while
+    jaewon.ee@ was equally valid on the sibling page -- a coin toss presented
+    as authoritative, reachable in the default configuration of every shipped
+    adapter (kaist cs+ee, gist cse+ee, snu cse+ee).
+    """
+    _use_paged_directory(monkeypatch, {
+        PAGE_CS: [_record("Jaewon Kim", "jaewon.cs@dir.example.com", "Professor")],
+        PAGE_EE: [_record("Jaewon Kim", "jaewon.ee@dir.example.com", "Professor")],
+    })
+    person = _directory_person(db, "Jaewon Kim")
+    result = resolve_email(db, client, person)
+    assert result.email is None
+    assert result.source != "adapter"
+    assert result.title is None, "an ambiguous record's title must not be persisted"
+
+
+@respx.mock
+def test_unambiguous_match_on_a_later_page_still_resolves(db, client, monkeypatch):
+    """Accumulating across pages must not stop the second page being usable."""
+    _use_paged_directory(monkeypatch, {
+        PAGE_CS: [_record("Minsoo Kim", "minsoo@dir.example.com")],
+        PAGE_EE: [_record("Jaewon Kim", "jaewon.ee@dir.example.com", "Professor")],
+    })
+    person = _directory_person(db, "Jaewon Kim")
+    result = resolve_email(db, client, person)
+    assert result.email == "jaewon.ee@dir.example.com"
+    assert result.confidence == "high"
+    assert result.source == "adapter"
+    assert result.title == "Professor"
+
+
+@respx.mock
+def test_partial_directory_fetch_never_claims_a_unique_match(db, client, monkeypatch):
+    """A page that could not be read leaves uniqueness unproven, so: no match.
+
+    The unread page is exactly where the second Jaewon Kim would be. Treating
+    a partial directory as complete is the same coin toss in a subtler form.
+    """
+    _use_paged_directory(
+        monkeypatch,
+        {PAGE_CS: [_record("Jaewon Kim", "jaewon.cs@dir.example.com", "Professor")]},
+        client=client,
+        blocked=[PAGE_EE],
+    )
+    person = _directory_person(db, "Jaewon Kim")
+    result = resolve_email(db, client, person)
+    assert result.email is None
+    assert result.source != "adapter"
+    assert result.title is None
+
+
+# ============================================================================
+# C2 residual 2: a surname plus a single initial is not an identity.
+# ============================================================================
+
+
+@respx.mock
+def test_surname_plus_initial_is_not_enough_to_bind(db, client, monkeypatch):
+    """C2 residual 2: `len(tokens) >= 2` counted a one-letter token.
+
+    "S. Park" and "Park, S." both normalise to {'park', 's'}, compare equal and
+    bind -- in a directory of hundreds, that is whichever S. Park was listed.
+    """
+    _use_directory(monkeypatch, [
+        _record("Park, S.", "sungho@dir.example.com", "Professor"),
+    ])
+    person = _directory_person(db, "S. Park")
+    result = resolve_email(db, client, person)
+    assert result.email is None
+    assert result.source != "adapter"
+    assert result.title is None
+
+
+def test_initialled_names_are_unusable_as_identities():
+    """Both sides of the comparison must be rejected, target and record alike."""
+    from gradpath.sources.emails import match_directory_record
+
+    assert match_directory_record("S. Park", [_record("Park, S.")]) is None
+    assert match_directory_record("S. Park", [_record("Sungho Park")]) is None
+    assert match_directory_record("Sungho Park", [_record("Park, S.")]) is None
+    assert match_directory_record("J. R. Kim", [_record("Kim, J. R.")]) is None
+
+
+# ============================================================================
+# Regression: the name folding that makes Korean/Japanese directories work at
+# all must survive any future tightening of the matcher.
+# ============================================================================
+
+STILL_MATCHES = [
+    ("Sunmi Park", "Sunmi Park"),                   # exact
+    ("Sunmi Park", "Park Sunmi"),                   # inverted order
+    ("Sunmi Park", "Park, Sunmi"),                  # "Family, Given" form
+    ("Sunmi Park", "Prof. Sunmi Park"),             # honorific prefix
+    ("Sunmi Park", "Assoc. Prof. Park Sunmi"),      # honorific + inverted
+    ("José García", "Jose Garcia"),                 # accents folded away
+    ("Jürgen Müller", "Jurgen Muller"),
+    ("Jaewon Kim", "김재원 (Jaewon Kim)"),            # mixed script
+    ("Li Bo", "Bo Li"),                             # two short-but-real tokens
+]
+
+STILL_MISSES = [
+    ("Anne Marie", "Anne Marie Smith"),             # a strict subset is not a match
+    ("Anne Marie Smith", "Anne Marie"),
+    ("Kim", "Jaewon Kim"),                          # one token is not an identity
+    ("김재원", "김재원"),                              # no ascii tokens at all
+]
+
+
+@pytest.mark.parametrize(("target", "listed"), STILL_MATCHES)
+def test_known_good_matches_keep_matching(target, listed):
+    from gradpath.sources.emails import match_directory_record
+
+    assert match_directory_record(target, [_record(listed)]) is not None
+    assert match_directory_record(listed, [_record(target)]) is not None
+
+
+@pytest.mark.parametrize(("target", "listed"), STILL_MISSES)
+def test_known_non_matches_keep_missing(target, listed):
+    from gradpath.sources.emails import match_directory_record
+
+    assert match_directory_record(target, [_record(listed)]) is None

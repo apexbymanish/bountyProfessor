@@ -36,9 +36,16 @@ def normalise_name(name: str) -> frozenset[str]:
     Accents, case, punctuation and honorifics are folded away, and the result
     is a *set* so "Sunmi Park" and "Park Sunmi" compare equal -- Korean and
     Japanese directories invert order freely, and OpenAlex does not.
-    Single-token names return an empty set: one token is not enough to
-    identify a person, and treating it as a match is exactly the bug that
-    attached a stranger's address to a row at confidence 'high'.
+
+    A name is only usable as an identity if it carries at least two tokens of
+    two or more characters. One token is not enough to identify a person, and
+    neither is a surname plus a bare initial: "S. Park" and "Park, S." both
+    reduce to {'park', 's'} and would compare equal, binding whichever S. Park
+    a directory of hundreds happened to list. Initials that do survive the gate
+    stay in the returned set, so "John F Kennedy" still differs from "John
+    Kennedy" -- dropping them would be a loosening, and loosening is how a
+    wrong bind gets reintroduced. The threshold is two characters, not three,
+    because "Li Bo" is a whole name.
     """
     folded = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode()
     tokens = {
@@ -46,7 +53,8 @@ def normalise_name(name: str) -> frozenset[str]:
         for token in re.split(r"[^a-z0-9]+", folded.lower())
         if token and token not in HONORIFICS
     }
-    return frozenset(tokens) if len(tokens) >= 2 else frozenset()
+    substantive = [token for token in tokens if len(token) >= 2]
+    return frozenset(tokens) if len(substantive) >= 2 else frozenset()
 
 
 def _recent_dois(conn: sqlite3.Connection, person_id: int, limit: int = 5) -> list[str]:
@@ -82,7 +90,23 @@ def match_directory_record(
 def adapter_record(
     conn: sqlite3.Connection, client: PoliteClient, person_row: sqlite3.Row
 ) -> FacultyRecord | None:
-    """Find this person's own row in their institution's faculty directory."""
+    """Find this person's own row in their institution's faculty directory.
+
+    The directory is every page the adapter exposes, not whichever page is read
+    first: all three shipped adapters list two departmental pages, so checking
+    uniqueness per page can never see the second Jaewon Kim one department
+    over, and the ambiguity guard in `match_directory_record` never fires.
+    Records are therefore accumulated across every page and the guard applied
+    once, against the whole set.
+
+    A page that cannot be read (circuit-broken host, or disallowed by
+    robots.txt) does not abort the resolution -- the remaining sources still
+    run -- but it does forfeit the adapter step entirely: an unread page is
+    precisely where a same-named colleague would be, so uniqueness across the
+    directory is unproven and no match can be claimed. That costs addresses
+    when a department page is permanently unreachable, which is recoverable;
+    the alternative is a stranger's address labelled 'high', which is not.
+    """
     institution = conn.execute(
         "SELECT adapter FROM institutions WHERE id = ?", (person_row["institution_id"],)
     ).fetchone()
@@ -92,17 +116,21 @@ def adapter_record(
     if adapter_cls is None:
         return None
     adapter = adapter_cls()
+    records: list[FacultyRecord] = []
+    complete = True
     for url in adapter.faculty_urls():
         try:
             html = client.get_text(url)
         except HostBlocked:
+            complete = False
             continue
         if html is None:
+            complete = False
             continue
-        record = match_directory_record(person_row["name"], adapter.parse_faculty(html, url))
-        if record is not None:
-            return record
-    return None
+        records.extend(adapter.parse_faculty(html, url))
+    if not complete:
+        return None
+    return match_directory_record(person_row["name"], records)
 
 
 def resolve_email(
