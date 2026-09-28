@@ -23,3 +23,9 @@ venv/
 
 # sdd scratch
 .superpowers/
+
+# Downloaded papers — publisher-copyrighted, local reading only.
+# Redistributing them here would be infringement, and a supervisor finding
+# their own paywalled PDF in this repo would be a poor first impression.
+research/papers/
+*.pdf
